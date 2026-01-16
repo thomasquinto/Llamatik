@@ -201,9 +201,12 @@ bool llama_generate_init(const char *model_path) {
     }
 
     llama_model_params model_params = llama_model_default_params();
+    // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
+    model_params.n_gpu_layers = 99;
+    __android_log_print(ANDROID_LOG_INFO, "llama_jni", "Loading model with n_gpu_layers=%d", model_params.n_gpu_layers);
     gen_model = llama_model_load_from_file(model_path, model_params);
     if (!gen_model) return false;
-    __android_log_print(ANDROID_LOG_INFO, "llama_jni", "Gen model loaded.");
+    __android_log_print(ANDROID_LOG_INFO, "llama_jni", "Gen model loaded with GPU acceleration.");
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.embeddings = false;

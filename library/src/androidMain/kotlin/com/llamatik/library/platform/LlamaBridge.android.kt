@@ -56,31 +56,14 @@ actual object LlamaBridge {
         nativeGenerateStream(prompt, callback)
     }
 
-    // Compose the same chat prompt you use on native. This mirrors your Gemma-style tags
-    // and matches the EOT checks we added in C++ (<start_of_turn>, <end_of_turn>, <|eot_id|>).
-    private fun buildChatPrompt(systemPrompt: String, contextBlock: String, userPrompt: String): String {
-        return buildString {
-            append("<start_of_turn>system\n")
-            append(systemPrompt.trim())
-            append("\n<end_of_turn>\n")
-            append("<start_of_turn>user\n")
-            append("CONTEXT:\n")
-            append(contextBlock.trim())
-            append("\n\nQUESTION:\n")
-            append(userPrompt.trim())
-            append("\n<end_of_turn>\n")
-            append("<start_of_turn>assistant\n")
-        }
-    }
-
     actual fun generateStreamWithContext(
         systemPrompt: String,
         contextBlock: String,
         userPrompt: String,
         callback: GenStream
     ) {
-        val prompt = buildChatPrompt(systemPrompt, contextBlock, userPrompt)
-        generateStream(prompt, callback)
+        // Delegate to native code which handles prompt formatting in a model-agnostic way
+        nativeGenerateWithContextStream(systemPrompt, contextBlock, userPrompt, callback)
     }
 
     actual fun generateWithContextStream(

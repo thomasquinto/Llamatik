@@ -1,6 +1,7 @@
 #include <jni.h>
 #include "llama.h"
 #include "llama_jni.h"
+#include "ggml-backend.h"
 
 #include <string>
 #include <sstream>
@@ -12,6 +13,9 @@
 #include <vector>
 #include <atomic>
 #include <cstdio>
+#include <thread>
+#include <chrono>
+#include <mutex>
 
 // ===================================================================================
 //                              PLATFORM LOGGING
@@ -58,14 +62,47 @@ static struct llama_context *gen_ctx = nullptr;
 // Backend lifetime
 static bool g_backend_inited = false;
 
+// Llama log callback to redirect logs to Android logcat
+static void llama_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void)user_data;
+    if (text == nullptr) return;
+    // Remove trailing newline if present
+    std::string msg(text);
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+        msg.pop_back();
+    }
+    if (msg.empty()) return;
+
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR:
+            LOGE("llama: %s", msg.c_str());
+            break;
+        case GGML_LOG_LEVEL_WARN:
+            LOGW("llama: %s", msg.c_str());
+            break;
+        case GGML_LOG_LEVEL_INFO:
+            LOGI("llama: %s", msg.c_str());
+            break;
+        default:
+            LOGD("llama: %s", msg.c_str());
+            break;
+    }
+}
+
 // Streaming cancel flag (for generateStream)
 static std::atomic<bool> g_cancel_requested{false};
 
-static std::atomic<float> g_temperature     = 0.55f;
-static std::atomic<float> g_top_p          = 0.80f;
-static std::atomic<int>   g_top_k          = 20;
+// Flag to track if generation is in progress (for safe shutdown)
+static std::atomic<bool> g_generation_in_progress{false};
+
+// Mutex to serialize generation calls (prevents KV cache corruption)
+static std::mutex g_generation_mutex;
+
+static std::atomic<float> g_temperature     = 0.7f;   // align with app default
+static std::atomic<float> g_top_p          = 0.95f;  // align with app default
+static std::atomic<int>   g_top_k          = 40;     // align with app default
 static std::atomic<float> g_repeat_penalty = 1.10f;
-static std::atomic<int>   g_max_new_tokens = 640;
+static std::atomic<int>   g_max_new_tokens = 512;    // align with app default
 
 // ===================================================================================
 //                              SMALL HELPERS
@@ -257,32 +294,26 @@ static std::string sanitize_generation(std::string s) {
 }
 
 // ---------- Chat templating ----------
-static std::string build_user_with_context(const std::string &context_block,
-        const std::string &user_question) {
-    auto t = [](const std::string &x) { return trim(x); };
-    if (t(context_block).empty()) return "QUESTION:\n" + user_question;
-    std::ostringstream oss;
-    oss << "CONTEXT:\n" << context_block << "\n\nQUESTION:\n" << user_question;
-    return oss.str();
-}
-
-static std::string build_chat_prompt_gemma(const std::string &system_msg,
+// Model-agnostic plain prompt format that works with any model.
+// This avoids hardcoding model-specific chat templates (like Gemma's <start_of_turn>)
+// which cause issues when used with other models (like Llama).
+static std::string build_plain_prompt(const std::string &system_msg,
+        const std::string &context_block,
         const std::string &user_msg) {
     std::ostringstream oss;
-    const std::string sys = (system_msg.empty()
-            ? "You are a careful assistant. Answer ONLY from the provided context. "
-              "If the context is insufficient, respond exactly: \"I don't have enough information in my sources.\" "
-              "Write 2–5 short sentences in plain text. Do not use bullets or numbering."
-            : system_msg + " Write 2–5 short sentences in plain text. Do not use bullets or numbering.");
 
-    oss << "<start_of_turn>system\n"
-        << sys
-        << "\n<end_of_turn>\n"
-        << "<start_of_turn>user\n"
-        << user_msg
-        << "\n<end_of_turn>\n"
-        << "<start_of_turn>model\n"
-        << "ANSWER: ";
+    // Add system instructions if provided
+    if (!trim(system_msg).empty()) {
+        oss << "Instructions: " << system_msg << "\n\n";
+    }
+
+    // Add context if provided
+    if (!trim(context_block).empty()) {
+        oss << "Context:\n" << context_block << "\n\n";
+    }
+
+    // Add user question
+    oss << "Question:\n" << user_msg << "\n\nAnswer:\n";
     return oss.str();
 }
 
@@ -302,6 +333,9 @@ Java_com_llamatik_library_platform_LlamaBridge_initModel(JNIEnv *env, jobject, j
     }
 
     llama_model_params mparams = llama_model_default_params();
+    // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
+    mparams.n_gpu_layers = 99;
+    LOGI("Loading embed model with n_gpu_layers=%d", mparams.n_gpu_layers);
     emb_model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(modelPath, path);
 
@@ -390,6 +424,27 @@ Java_com_llamatik_library_platform_LlamaBridge_embed(JNIEnv *env, jobject, jstri
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
+    LOGI("shutdown: starting, generation_in_progress=%d", g_generation_in_progress.load());
+
+    // Signal cancellation first
+    g_cancel_requested.store(true, std::memory_order_release);
+
+    // Wait for any ongoing generation to complete (with timeout)
+    // This is critical to prevent use-after-free crashes
+    int wait_count = 0;
+    const int max_wait_ms = 5000; // 5 second timeout
+    const int sleep_ms = 10;
+    while (g_generation_in_progress.load(std::memory_order_acquire) && wait_count < (max_wait_ms / sleep_ms)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        wait_count++;
+    }
+
+    if (wait_count >= (max_wait_ms / sleep_ms)) {
+        LOGE("shutdown: WARNING - generation did not stop within timeout, proceeding anyway");
+    } else {
+        LOGI("shutdown: generation stopped after %d ms", wait_count * sleep_ms);
+    }
+
     if (emb_ctx) llama_free(emb_ctx);
     if (emb_model) llama_model_free(emb_model);
     emb_ctx = nullptr;
@@ -404,6 +459,8 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
         llama_backend_free();
         g_backend_inited = false;
     }
+
+    LOGI("shutdown: complete");
 }
 
 // ===================================================================================
@@ -417,11 +474,34 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     LOGI("initGenerateModel: %s", path ? path : "(null)");
 
     if (!g_backend_inited) {
+        // Set up log callback before initializing backend
+        llama_log_set(llama_log_callback, nullptr);
+
         llama_backend_init();
         g_backend_inited = true;
+
+        // Log available backends
+        size_t num_devices = ggml_backend_dev_count();
+        LOGI("Available backends: %zu devices", num_devices);
+        for (size_t i = 0; i < num_devices; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (dev) {
+                const char* name = ggml_backend_dev_name(dev);
+                const char* desc = ggml_backend_dev_description(dev);
+                enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                const char* type_str = (type == GGML_BACKEND_DEVICE_TYPE_CPU) ? "CPU" :
+                                       (type == GGML_BACKEND_DEVICE_TYPE_GPU) ? "GPU" :
+                                       (type == GGML_BACKEND_DEVICE_TYPE_IGPU) ? "IGPU" :
+                                       (type == GGML_BACKEND_DEVICE_TYPE_ACCEL) ? "ACCEL" : "UNKNOWN";
+                LOGI("  Device %zu: %s (%s) - Type: %s (raw=%d)", i, name ? name : "unknown", desc ? desc : "no desc", type_str, (int)type);
+            }
+        }
     }
 
     llama_model_params mparams = llama_model_default_params();
+    // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
+    mparams.n_gpu_layers = 99;
+    LOGI("Loading model with n_gpu_layers=%d", mparams.n_gpu_layers);
     gen_model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(modelPath, path);
 
@@ -565,14 +645,8 @@ Java_com_llamatik_library_platform_LlamaBridge_generateWithContext(
     if (jContext) env->ReleaseStringUTFChars(jContext, pctx);
     if (jUser) env->ReleaseStringUTFChars(jUser, pusr);
 
-    if (trim(system).empty()) {
-        system = "You are a careful assistant. Answer ONLY from the provided context. "
-                 "If the context is insufficient, respond exactly: \"I don't have enough information in my sources.\" "
-                 "Write 2–5 short sentences in plain text. Do not use bullets or numbering.";
-    }
-
-    std::string user_turn = build_user_with_context(ctx, user);
-    std::string prompt = build_chat_prompt_gemma(system, user_turn);
+    // Use model-agnostic plain prompt format
+    std::string prompt = build_plain_prompt(system, ctx, user);
     jstring jp = env->NewStringUTF(prompt.c_str());
     jstring r = Java_com_llamatik_library_platform_LlamaBridge_generate(env, nullptr, jp);
     env->DeleteLocalRef(jp);
@@ -604,10 +678,17 @@ static inline bool is_eot_piece(const char *s) {
 
 // Streams tokens from a prepared prompt string
 static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallback, const StreamMethods &m) {
+    // Serialize generation calls to prevent KV cache corruption
+    // This ensures only one generation runs at a time
+    std::lock_guard<std::mutex> lock(g_generation_mutex);
+
     if (!gen_ctx || !gen_model) {
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("model not initialized"));
         return;
     }
+
+    // Mark generation as in progress (for safe shutdown)
+    g_generation_in_progress.store(true, std::memory_order_release);
 
     // Reset cancel flag at the start of each stream
     g_cancel_requested.store(false, std::memory_order_relaxed);
@@ -619,6 +700,7 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
             /*add_bos*/ true,
             /*parse_special*/ true);
     if (n_tokens <= 0) {
+        g_generation_in_progress.store(false, std::memory_order_release);
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("tokenization failed"));
         return;
     }
@@ -638,6 +720,7 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
     }
     if (llama_decode(gen_ctx, batch) != 0) {
         llama_batch_free(batch);
+        g_generation_in_progress.store(false, std::memory_order_release);
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed on prompt"));
         return;
     }
@@ -705,9 +788,10 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
 
         if (llama_decode(gen_ctx, step) != 0) {
             llama_batch_free(step);
-            env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed mid-stream"));
             llama_sampler_free(sampler);
             llama_batch_free(batch);
+            g_generation_in_progress.store(false, std::memory_order_release);
+            env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed mid-stream"));
             return;
         }
         llama_batch_free(step);
@@ -715,6 +799,9 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
 
     llama_sampler_free(sampler);
     llama_batch_free(batch);
+
+    // Mark generation as complete (for safe shutdown)
+    g_generation_in_progress.store(false, std::memory_order_release);
 
     // Always signal completion – Kotlin side will ignore if it has nulled activeRequestId
     env->CallVoidMethod(jCallback, m.onComplete);
@@ -776,14 +863,8 @@ Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateWithContextStream(
     if (jContext) env->ReleaseStringUTFChars(jContext, pctx);
     if (jUser) env->ReleaseStringUTFChars(jUser, pusr);
 
-    if (trim(system).empty()) {
-        system = "You are a careful assistant. Answer ONLY from the provided context. "
-                 "If the context is insufficient, respond exactly: \"I don't have enough information in my sources.\" "
-                 "Write 2–5 short sentences in plain text. Do not use bullets or numbering.";
-    }
-
-    std::string user_turn = build_user_with_context(ctx, user);
-    std::string prompt = build_chat_prompt_gemma(system, user_turn);
+    // Use model-agnostic plain prompt format
+    std::string prompt = build_plain_prompt(system, ctx, user);
 
     stream_from_prompt(env, prompt.c_str(), jCallback, m);
 }

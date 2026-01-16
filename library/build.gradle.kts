@@ -256,6 +256,8 @@ compose.resources {
 android {
     namespace = "com.llamatik"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
+    // Use NDK 26 which is available on this machine
+    ndkVersion = "26.1.10909125"
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
         ndk {
@@ -263,6 +265,18 @@ android {
             abiFilters.add("x86_64")
         }
         consumerProguardFiles("consumer-rules.pro")
+        externalNativeBuild {
+            cmake {
+                // Always build native code with Release optimizations for performance
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                // Use API 29 for Vulkan 1.1 support (vkGetPhysicalDeviceFeatures2, etc.)
+                arguments += "-DANDROID_PLATFORM=android-29"
+                // Vulkan GPU acceleration: set -Pllamatik.vulkan=true to enable
+                // Default is CPU-only which is faster on many devices
+                val enableVulkan = project.findProperty("llamatik.vulkan")?.toString()?.toBoolean() ?: false
+                arguments += "-DLLAMATIK_ENABLE_VULKAN=${if (enableVulkan) "ON" else "OFF"}"
+            }
+        }
     }
 
     buildTypes {
@@ -282,6 +296,9 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = false
+            // Exclude the OpenCL stub library - it's only used for linking
+            // At runtime, the app uses the system's /vendor/lib64/libOpenCL.so
+            excludes += "**/libOpenCL.so"
         }
     }
 

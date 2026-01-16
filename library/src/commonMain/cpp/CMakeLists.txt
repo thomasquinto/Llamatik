@@ -16,9 +16,34 @@ set(CMAKE_SHARED_LINKER_FLAGS
         "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--section-start=.note.gnu.build-id=0x4000 -Wl,--no-rosegment"
 )
 
-# (Optional) If supported by your ggml version:
-option(GGML_CPU_ARM_USE_DOTPROD "Enable ARM dot product" OFF)
-option(GGML_CPU_ARM_USE_I8MM    "Enable ARM i8mm"       OFF)
+# ARM CPU optimization for Android
+# armv8.2-a+dotprod+fp16 is supported by ~95% of Android devices (2018+)
+# This includes: Snapdragon 845+, Exynos 9810+, Tensor G1+, Dimensity 800+
+if(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "ARM architecture" FORCE)
+endif()
+
+# GPU acceleration option for Android
+# Default: OFF (CPU with ARM optimizations is often faster than Vulkan on many devices)
+# To enable Vulkan: pass -DLLAMATIK_ENABLE_VULKAN=ON to CMake
+option(LLAMATIK_ENABLE_VULKAN "Enable Vulkan GPU acceleration for Android" OFF)
+
+if(ANDROID)
+    if(LLAMATIK_ENABLE_VULKAN)
+        set(GGML_VULKAN ON CACHE BOOL "Enable Vulkan GPU acceleration" FORCE)
+
+        # Use system Vulkan headers (from Vulkan SDK) if available
+        if(EXISTS "/usr/local/include/vulkan/vulkan.hpp")
+            include_directories(SYSTEM "/usr/local/include")
+            message(STATUS "Using system Vulkan C++ headers from /usr/local/include")
+        endif()
+
+        message(STATUS "Vulkan GPU acceleration ENABLED")
+    else()
+        set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan GPU acceleration" FORCE)
+        message(STATUS "Using CPU-only with ARM optimizations (dotprod+fp16)")
+    endif()
+endif()
 
 add_subdirectory("${CMAKE_SOURCE_DIR}/../../../../llama.cpp/" "${CMAKE_BINARY_DIR}/llama")
 
@@ -35,22 +60,3 @@ target_include_directories(llama_jni PRIVATE
 )
 
 target_link_libraries(llama_jni llama ${log-lib})
-
-# ---- SAFE FLAGS ON ARM64 (pick ONE block) ----
-# Option A: baseline ARMv8-A
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
-    foreach(tgt IN ITEMS llama llama_jni ggml ggml-base ggml-cpu)
-        if (TARGET ${tgt})
-            target_compile_options(${tgt} PRIVATE -march=armv8-a)
-        endif()
-    endforeach()
-endif()
-
-# Option B (alternative): strict old core
-# if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
-#   foreach(tgt IN ITEMS llama llama_jni ggml ggml-base ggml-cpu)
-#     if (TARGET ${tgt})
-#       target_compile_options(${tgt} PRIVATE -mcpu=cortex-a53)
-#     endif()
-#   endforeach()
-# endif()

@@ -10,6 +10,9 @@
 #include <cctype>   // tolower, isalpha
 #include <cstdarg>  // va_list, va_start, va_end
 #include <atomic>
+#include <mutex>
+#include <thread>
+#include <chrono>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -51,9 +54,15 @@ static struct llama_context *gen_ctx    = nullptr;
 static bool g_backend_inited = false;
 static std::atomic<bool> g_cancel_requested{false};
 
+// Flag to track if generation is in progress (for safe shutdown)
+static std::atomic<bool> g_generation_in_progress{false};
+
+// Mutex to serialize generation calls (prevents KV cache corruption)
+static std::mutex g_generation_mutex;
+
 // Generation parameters (atomic for safe update while app is running)
-static std::atomic<float> g_temperature{0.55f};
-static std::atomic<int>   g_max_tokens{256};     // align with app default
+static std::atomic<float> g_temperature{0.7f};   // align with app default
+static std::atomic<int>   g_max_tokens{512};     // align with app default
 static std::atomic<float> g_top_p{0.95f};
 static std::atomic<int>   g_top_k{40};
 static std::atomic<float> g_repeat_penalty{1.10f};
@@ -455,16 +464,10 @@ char *llama_generate(const char *prompt) {
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
-    // We treat `prompt` we receive as the *Question* and build our wrapper.
-    std::string wrapped;
-    if (!apply_chat_template_if_available(nullptr, prompt, wrapped)) {
-        wrapped = build_plain_prompt(/*context=*/"", /*question=*/prompt);
-    }
-
-    // 2) Tokenize + prompt decode
+    // Use prompt as-is (caller is responsible for formatting)
     const llama_vocab *v = llama_model_get_vocab(gen_model);
     std::vector<llama_token> tokens(2048);
-    int n_tokens = tokenize_with_retry(v, wrapped.c_str(), tokens, /*add_bos*/ true, /*parse_special*/ true);
+    int n_tokens = tokenize_with_retry(v, prompt, tokens, /*add_bos*/ true, /*parse_special*/ true);
     if (n_tokens <= 0) return nullptr;
     tokens.resize(n_tokens);
 
@@ -617,7 +620,13 @@ void llama_generate_stream(const char *prompt,
         llm_on_done on_done,
         llm_on_error on_error,
         void *user) {
+    // Serialize generation calls to prevent KV cache corruption
+    std::lock_guard<std::mutex> lock(g_generation_mutex);
+
     if (!gen_ctx || !gen_model || !prompt) { if (on_error) on_error("generator not ready", user); return; }
+
+    // Mark generation as in progress (for safe shutdown)
+    g_generation_in_progress.store(true, std::memory_order_release);
 
     // Snapshot params at start (atomic -> local)
     const float temperature    = g_temperature.load(std::memory_order_relaxed);
@@ -630,17 +639,16 @@ void llama_generate_stream(const char *prompt,
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
-    // Wrap incoming prompt as Question only (no system echo)
-    std::string wrapped;
-    if (!apply_chat_template_if_available(nullptr, prompt, wrapped)) {
-        wrapped = build_plain_prompt(/*context=*/"", /*question=*/prompt);
-    }
-
+    // Use prompt as-is (caller is responsible for formatting)
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
-            wrapped.c_str(),
+            prompt,
             tokens, /*add_bos*/ true, /*parse_special*/ true);
-    if (n_tokens <= 0) { if (on_error) on_error("tokenize failed", user); return; }
+    if (n_tokens <= 0) {
+        g_generation_in_progress.store(false, std::memory_order_release);
+        if (on_error) on_error("tokenize failed", user);
+        return;
+    }
     tokens.resize(n_tokens);
 
     const unsigned int n_ctx = llama_n_ctx(gen_ctx);
@@ -660,6 +668,7 @@ void llama_generate_stream(const char *prompt,
 
     if (llama_decode(gen_ctx, batch) != 0) {
         llama_batch_free(batch);
+        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("decode failed", user);
         return;
     }
@@ -667,6 +676,7 @@ void llama_generate_stream(const char *prompt,
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!sampler) {
         llama_batch_free(batch);
+        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("sampler init failed", user);
         return;
     }
@@ -759,6 +769,9 @@ void llama_generate_stream(const char *prompt,
     llama_batch_free(batch);
     llama_sampler_free(sampler);
 
+    // Mark generation as complete (for safe shutdown)
+    g_generation_in_progress.store(false, std::memory_order_release);
+
     if (on_done) on_done(user);
 }
 
@@ -788,6 +801,27 @@ void llama_generate_set_params(float temperature,
 }
 
 void llama_generate_free() {
+    DBG("llama_generate_free: starting, generation_in_progress=%d", g_generation_in_progress.load());
+
+    // Signal cancellation first
+    g_cancel_requested.store(true, std::memory_order_release);
+
+    // Wait for any ongoing generation to complete (with timeout)
+    // This is critical to prevent use-after-free crashes
+    int wait_count = 0;
+    const int max_wait_ms = 5000; // 5 second timeout
+    const int sleep_ms = 10;
+    while (g_generation_in_progress.load(std::memory_order_acquire) && wait_count < (max_wait_ms / sleep_ms)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        wait_count++;
+    }
+
+    if (wait_count >= (max_wait_ms / sleep_ms)) {
+        DBG("llama_generate_free: WARNING - generation did not stop within timeout");
+    } else {
+        DBG("llama_generate_free: generation stopped after %d ms", wait_count * sleep_ms);
+    }
+
     if (gen_ctx)   llama_free(gen_ctx);
     if (gen_model) llama_model_free(gen_model);
     gen_ctx   = nullptr;
@@ -797,6 +831,8 @@ void llama_generate_free() {
         llama_backend_free();
         g_backend_inited = false;
     }
+
+    DBG("llama_generate_free: complete");
 }
 
 } // extern "C"
