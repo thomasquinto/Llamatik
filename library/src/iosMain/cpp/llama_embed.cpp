@@ -52,7 +52,13 @@ static struct llama_model   *gen_model  = nullptr; // generation model
 static struct llama_context *gen_ctx    = nullptr;
 
 static bool g_backend_inited = false;
-static std::atomic<bool> g_cancel_requested{false};
+
+// Generation session ID - incremented for each new generation
+// Used to ensure cancellation only affects the intended generation
+static std::atomic<uint64_t> g_generation_session_id{0};
+
+// The session ID that should be cancelled (0 = no cancellation pending)
+static std::atomic<uint64_t> g_cancel_session_id{0};
 
 // Flag to track if generation is in progress (for safe shutdown)
 static std::atomic<bool> g_generation_in_progress{false};
@@ -68,6 +74,15 @@ static std::atomic<int>   g_top_k{40};
 static std::atomic<float> g_repeat_penalty{1.10f};
 
 // ===================== Helpers =====================
+
+// Check if the given session should be cancelled
+// Returns true if:
+// 1. The cancel_session_id matches this session (targeted cancellation), OR
+// 2. The cancel_session_id is UINT64_MAX (shutdown/force cancel all)
+static inline bool should_cancel_session(uint64_t session_id) {
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    return cancel_id == session_id || cancel_id == UINT64_MAX;
+}
 
 static int tokenize_with_retry(const llama_vocab *vocab,
         const char *text,
@@ -356,7 +371,11 @@ bool llama_embed_init(const char *model_path) {
 }
 
 void llama_generate_cancel(void) {
-    g_cancel_requested.store(true, std::memory_order_relaxed);
+    // Cancel the CURRENT session only
+    // This prevents race conditions where a late cancellation affects a new generation
+    uint64_t current_session = g_generation_session_id.load(std::memory_order_relaxed);
+    DBG("llama_generate_cancel: requesting cancel for session %llu", (unsigned long long)current_session);
+    g_cancel_session_id.store(current_session, std::memory_order_relaxed);
 }
 
 float *llama_embed(const char *input) {
@@ -453,6 +472,9 @@ bool llama_generate_init(const char *model_path) {
 char *llama_generate(const char *prompt) {
     if (!gen_ctx || !gen_model || !prompt) return nullptr;
 
+    // Assign a new session ID for this generation
+    uint64_t session_id = ++g_generation_session_id;
+
     // Snapshot params at start (atomic -> local)
     const float temperature    = g_temperature.load(std::memory_order_relaxed);
     const int   max_tokens     = g_max_tokens.load(std::memory_order_relaxed);
@@ -460,7 +482,13 @@ char *llama_generate(const char *prompt) {
     const int   top_k          = g_top_k.load(std::memory_order_relaxed);
     const float repeat_penalty = g_repeat_penalty.load(std::memory_order_relaxed);
 
-    g_cancel_requested.store(false, std::memory_order_relaxed);
+    // Clear any stale cancellation that was for a previous session
+    // Clear if: cancel was for an older session, OR it's UINT64_MAX (shutdown signal)
+    // UINT64_MAX must be cleared because it cancels ALL sessions, including new ones
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
+        g_cancel_session_id.store(0, std::memory_order_relaxed);
+    }
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
@@ -516,8 +544,9 @@ char *llama_generate(const char *prompt) {
     int max_new_tokens = std::min(remaining_ctx, max_tokens);
 
     for (int i = 0; i < max_new_tokens; ++i) {
-        if (g_cancel_requested.load(std::memory_order_relaxed)) {
-            DBG("stream: cancelled at token %d", i);
+        // Check if THIS session should be cancelled (not a different one)
+        if (should_cancel_session(session_id)) {
+            DBG("generate: cancelled session %llu at token %d", (unsigned long long)session_id, i);
             break;
         }
 
@@ -623,10 +652,26 @@ void llama_generate_stream(const char *prompt,
     // Serialize generation calls to prevent KV cache corruption
     std::lock_guard<std::mutex> lock(g_generation_mutex);
 
+    // Assign a new session ID for this generation
+    // This must happen AFTER acquiring the mutex to ensure uniqueness
+    uint64_t session_id = ++g_generation_session_id;
+    DBG("llama_generate_stream: session_id=%llu, cancel_session=%llu",
+        (unsigned long long)session_id,
+        (unsigned long long)g_cancel_session_id.load());
+
     if (!gen_ctx || !gen_model || !prompt) { if (on_error) on_error("generator not ready", user); return; }
 
     // Mark generation as in progress (for safe shutdown)
     g_generation_in_progress.store(true, std::memory_order_release);
+
+    // Clear any stale cancellation that was for a previous session
+    // Clear if: cancel was for an older session, OR it's UINT64_MAX (shutdown signal)
+    // UINT64_MAX must be cleared because it cancels ALL sessions, including new ones
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
+        g_cancel_session_id.store(0, std::memory_order_relaxed);
+        DBG("llama_generate_stream: cleared stale cancel (was %llu)", (unsigned long long)cancel_id);
+    }
 
     // Snapshot params at start (atomic -> local)
     const float temperature    = g_temperature.load(std::memory_order_relaxed);
@@ -634,8 +679,6 @@ void llama_generate_stream(const char *prompt,
     const float top_p          = g_top_p.load(std::memory_order_relaxed);
     const int   top_k          = g_top_k.load(std::memory_order_relaxed);
     const float repeat_penalty = g_repeat_penalty.load(std::memory_order_relaxed);
-
-    g_cancel_requested.store(false, std::memory_order_relaxed);
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
@@ -703,8 +746,9 @@ void llama_generate_stream(const char *prompt,
     assembled.reserve(4096);
 
     for (int i = 0; i < max_new_tokens; ++i) {
-        if (g_cancel_requested.load(std::memory_order_relaxed)) {
-            DBG("stream: cancelled at token %d", i);
+        // Check if THIS session should be cancelled (not a different one)
+        if (should_cancel_session(session_id)) {
+            DBG("stream: cancelled session %llu at token %d", (unsigned long long)session_id, i);
             break;
         }
 
@@ -803,8 +847,9 @@ void llama_generate_set_params(float temperature,
 void llama_generate_free() {
     DBG("llama_generate_free: starting, generation_in_progress=%d", g_generation_in_progress.load());
 
-    // Signal cancellation first
-    g_cancel_requested.store(true, std::memory_order_release);
+    // Signal cancellation for ALL sessions (force shutdown)
+    // UINT64_MAX is a special value that cancels any session
+    g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
 
     // Wait for any ongoing generation to complete (with timeout)
     // This is critical to prevent use-after-free crashes

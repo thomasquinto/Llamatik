@@ -89,8 +89,12 @@ static void llama_log_callback(enum ggml_log_level level, const char * text, voi
     }
 }
 
-// Streaming cancel flag (for generateStream)
-static std::atomic<bool> g_cancel_requested{false};
+// Generation session ID - incremented for each new generation
+// Used to ensure cancellation only affects the intended generation
+static std::atomic<uint64_t> g_generation_session_id{0};
+
+// The session ID that should be cancelled (0 = no cancellation pending)
+static std::atomic<uint64_t> g_cancel_session_id{0};
 
 // Flag to track if generation is in progress (for safe shutdown)
 static std::atomic<bool> g_generation_in_progress{false};
@@ -107,6 +111,15 @@ static std::atomic<int>   g_max_new_tokens = 512;    // align with app default
 // ===================================================================================
 //                              SMALL HELPERS
 // ===================================================================================
+
+// Check if the given session should be cancelled
+// Returns true if:
+// 1. The cancel_session_id matches this session (targeted cancellation), OR
+// 2. The cancel_session_id is UINT64_MAX (shutdown/force cancel all)
+static inline bool should_cancel_session(uint64_t session_id) {
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    return cancel_id == session_id || cancel_id == UINT64_MAX;
+}
 
 static inline std::string trim(const std::string &s) {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -426,8 +439,9 @@ JNIEXPORT void JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     LOGI("shutdown: starting, generation_in_progress=%d", g_generation_in_progress.load());
 
-    // Signal cancellation first
-    g_cancel_requested.store(true, std::memory_order_release);
+    // Signal cancellation for ALL sessions (force shutdown)
+    // UINT64_MAX is a special value that cancels any session
+    g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
 
     // Wait for any ongoing generation to complete (with timeout)
     // This is critical to prevent use-after-free crashes
@@ -678,9 +692,18 @@ static inline bool is_eot_piece(const char *s) {
 
 // Streams tokens from a prepared prompt string
 static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallback, const StreamMethods &m) {
+    LOGI("stream_from_prompt: waiting for mutex...");
+
     // Serialize generation calls to prevent KV cache corruption
     // This ensures only one generation runs at a time
     std::lock_guard<std::mutex> lock(g_generation_mutex);
+
+    // Assign a new session ID for this generation
+    // This must happen AFTER acquiring the mutex to ensure uniqueness
+    uint64_t session_id = ++g_generation_session_id;
+    LOGI("stream_from_prompt: mutex acquired, session_id=%llu, cancel_session=%llu",
+         (unsigned long long)session_id,
+         (unsigned long long)g_cancel_session_id.load());
 
     if (!gen_ctx || !gen_model) {
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("model not initialized"));
@@ -690,9 +713,17 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
     // Mark generation as in progress (for safe shutdown)
     g_generation_in_progress.store(true, std::memory_order_release);
 
-    // Reset cancel flag at the start of each stream
-    g_cancel_requested.store(false, std::memory_order_relaxed);
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
+    // Clear any stale cancellation that was for a previous session
+    // Clear if: cancel was for an older session, OR it's UINT64_MAX (shutdown signal)
+    // UINT64_MAX must be cleared because it cancels ALL sessions, including new ones
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
+        g_cancel_session_id.store(0, std::memory_order_relaxed);
+        LOGI("stream_from_prompt: cleared stale cancel (was %llu)", (unsigned long long)cancel_id);
+    }
+
+    // Clear KV cache completely (data=true) to ensure consistent prompt processing speed
+    llama_memory_clear(llama_get_memory(gen_ctx), true);
 
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
@@ -718,12 +749,14 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
         batch.seq_id[i][0] = 0;
         batch.logits[i] = (i == batch.n_tokens - 1);
     }
+    LOGI("stream_from_prompt: decoding prompt (%d tokens)...", batch.n_tokens);
     if (llama_decode(gen_ctx, batch) != 0) {
         llama_batch_free(batch);
         g_generation_in_progress.store(false, std::memory_order_release);
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed on prompt"));
         return;
     }
+    LOGI("stream_from_prompt: prompt decoded successfully");
 
     float temperature    = g_temperature.load();
     float top_p          = g_top_p.load();
@@ -743,8 +776,15 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
     char piece_buf[768];
     char spec_buf[64];
 
+    LOGI("stream_from_prompt: starting token generation loop, max_tokens=%d, session=%llu",
+         max_new_tokens, (unsigned long long)session_id);
+
     for (int i = 0; i < max_new_tokens; ++i) {
-        if (g_cancel_requested.load(std::memory_order_relaxed)) {
+        // Check if THIS session should be cancelled (not a different one)
+        uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+        if (should_cancel_session(session_id)) {
+            LOGI("stream_from_prompt: cancel requested for session %llu at token %d (cancel_id=%llu)",
+                 (unsigned long long)session_id, i, (unsigned long long)cancel_id);
             break;
         }
 
@@ -803,6 +843,9 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
     // Mark generation as complete (for safe shutdown)
     g_generation_in_progress.store(false, std::memory_order_release);
 
+    LOGI("stream_from_prompt: generation complete for session %llu, releasing mutex",
+         (unsigned long long)session_id);
+
     // Always signal completion – Kotlin side will ignore if it has nulled activeRequestId
     env->CallVoidMethod(jCallback, m.onComplete);
 }
@@ -834,8 +877,15 @@ extern "C"
 JNIEXPORT void JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_nativeCancelGenerate(
         JNIEnv * /*env*/, jobject /*thiz*/) {
-    LOGI("nativeCancelGenerate: cancel requested");
-    g_cancel_requested.store(true, std::memory_order_relaxed);
+    // Cancel the CURRENT session only
+    // This prevents race conditions where a late cancellation affects a new generation
+    uint64_t current_session = g_generation_session_id.load(std::memory_order_relaxed);
+    uint64_t old_cancel = g_cancel_session_id.load(std::memory_order_relaxed);
+    LOGI("nativeCancelGenerate: requesting cancel for session %llu (was %llu, in_progress=%d)",
+         (unsigned long long)current_session,
+         (unsigned long long)old_cancel,
+         g_generation_in_progress.load() ? 1 : 0);
+    g_cancel_session_id.store(current_session, std::memory_order_relaxed);
 }
 
 extern "C"
