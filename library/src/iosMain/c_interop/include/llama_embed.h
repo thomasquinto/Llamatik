@@ -124,6 +124,28 @@ void llama_generate_set_params(float temperature,
         int top_k,
         float repeat_penalty);
 
+/**
+ * Stream generation using chat template with message array.
+ * Uses the model's embedded chat template if available, otherwise falls back to ChatML.
+ *
+ * @param roles Array of role strings ("system", "user", "assistant")
+ * @param contents Array of content strings
+ * @param n_messages Number of messages
+ * @param on_delta Callback for each token
+ * @param on_done Callback when complete
+ * @param on_error Callback on error
+ * @param user User data pointer
+ *
+ * NOTE: This call is synchronous/blocking; invoke off the main thread.
+ */
+void llama_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

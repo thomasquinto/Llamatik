@@ -22,6 +22,16 @@ expect object LlamaBridge {
         onDone: () -> Unit,
         onError: (String) -> Unit
     )
+
+    /**
+     * Generate streaming response using chat template with message array.
+     * Uses the model's embedded chat template if available, otherwise falls back to ChatML.
+     *
+     * @param messages List of ChatTemplateMessage (role + content pairs)
+     * @param callback GenStream callback for streaming tokens
+     */
+    fun generateStreamWithMessages(messages: List<ChatTemplateMessage>, callback: GenStream)
+
     fun shutdown()
     fun nativeCancelGenerate()
     fun updateGenerateParams(
@@ -31,6 +41,22 @@ expect object LlamaBridge {
         topK: Int,
         repeatPenalty: Float,
     )
+}
+
+/**
+ * A message for chat template formatting.
+ * @param role The role: "system", "user", or "assistant"
+ * @param content The message content
+ */
+data class ChatTemplateMessage(
+    val role: String,
+    val content: String
+) {
+    companion object {
+        fun system(content: String) = ChatTemplateMessage("system", content)
+        fun user(content: String) = ChatTemplateMessage("user", content)
+        fun assistant(content: String) = ChatTemplateMessage("assistant", content)
+    }
 }
 
 interface GenStream {

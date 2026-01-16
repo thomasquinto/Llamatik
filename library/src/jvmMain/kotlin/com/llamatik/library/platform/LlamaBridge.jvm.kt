@@ -103,6 +103,20 @@ actual object LlamaBridge {
         nativeGenerateWithContextStream(system, context, user, cb)
     }
 
+    // Native JNI function for message array streaming
+    // Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateWithMessagesStream
+    private external fun nativeGenerateWithMessagesStream(
+        roles: Array<String>,
+        contents: Array<String>,
+        callback: GenStream
+    )
+
+    actual fun generateStreamWithMessages(messages: List<ChatTemplateMessage>, callback: GenStream) {
+        val roles = messages.map { it.role }.toTypedArray()
+        val contents = messages.map { it.content }.toTypedArray()
+        nativeGenerateWithMessagesStream(roles, contents, callback)
+    }
+
     // These must exist as:
     // Java_com_llamatik_library_platform_LlamaBridge_shutdown
     // Java_com_llamatik_library_platform_LlamaBridge_nativeCancelGenerate

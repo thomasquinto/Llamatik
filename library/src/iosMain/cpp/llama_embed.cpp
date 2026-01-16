@@ -835,4 +835,119 @@ void llama_generate_free() {
     DBG("llama_generate_free: complete");
 }
 
+// ===================== Chat Template Streaming (Message Array API) =====================
+
+/**
+ * Build a prompt using llama.cpp's chat template system.
+ * Uses the model's embedded template if available, otherwise falls back to ChatML.
+ *
+ * @param roles Array of role strings ("system", "user", "assistant")
+ * @param contents Array of content strings
+ * @param n_messages Number of messages
+ * @return Formatted prompt string ready for tokenization
+ */
+static std::string build_chat_template_prompt_ios(const char **roles,
+        const char **contents,
+        int n_messages) {
+    if (!gen_model || n_messages <= 0) {
+        DBG("build_chat_template_prompt_ios: model not loaded or no messages");
+        return "";
+    }
+
+    // Build llama_chat_message array
+    std::vector<llama_chat_message> messages;
+    messages.reserve(n_messages);
+    for (int i = 0; i < n_messages; i++) {
+        messages.push_back({roles[i], contents[i]});
+    }
+
+    // Get the model's embedded chat template (may be nullptr)
+    const char *model_template = llama_model_chat_template(gen_model, nullptr);
+
+    if (model_template) {
+        DBG("Using model's embedded chat template");
+    } else {
+        DBG("Model has no embedded template, using ChatML fallback");
+    }
+
+    // Estimate buffer size: 2x total content length + overhead for template tokens
+    size_t total_content_len = 0;
+    for (const auto &msg : messages) {
+        total_content_len += std::strlen(msg.role) + std::strlen(msg.content);
+    }
+    size_t buf_size = std::max(total_content_len * 3 + 256, (size_t)4096);
+
+    std::vector<char> buf(buf_size);
+
+    // Apply the chat template
+    int32_t result = llama_chat_apply_template(
+            model_template,
+            messages.data(),
+            messages.size(),
+            true,  // add_ass: add assistant turn start tokens
+            buf.data(),
+            (int32_t)buf.size()
+    );
+
+    if (result < 0) {
+        DBG("llama_chat_apply_template failed with error %d", result);
+        return "";
+    }
+
+    // If buffer was too small, resize and retry
+    if ((size_t)result > buf.size()) {
+        buf.resize(result + 1);
+        result = llama_chat_apply_template(
+                model_template,
+                messages.data(),
+                messages.size(),
+                true,
+                buf.data(),
+                (int32_t)buf.size()
+        );
+        if (result < 0) {
+            DBG("llama_chat_apply_template retry failed with error %d", result);
+            return "";
+        }
+    }
+
+    std::string prompt(buf.data(), result);
+    DBG("Chat template prompt (%d chars): %.100s...", result, prompt.c_str());
+    return prompt;
+}
+
+/**
+ * Stream generation using chat template with message array.
+ *
+ * @param roles Array of role strings ("system", "user", "assistant")
+ * @param contents Array of content strings
+ * @param n_messages Number of messages
+ * @param on_delta Callback for each token
+ * @param on_done Callback when complete
+ * @param on_error Callback on error
+ * @param user User data pointer
+ */
+void llama_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user) {
+    if (!roles || !contents || n_messages <= 0) {
+        if (on_error) on_error("invalid arguments: roles, contents, or n_messages", user);
+        return;
+    }
+
+    std::string prompt = build_chat_template_prompt_ios(roles, contents, n_messages);
+
+    if (prompt.empty()) {
+        if (on_error) on_error("failed to build chat template prompt", user);
+        return;
+    }
+
+    // Use existing stream function with the templated prompt
+    llama_generate_stream(prompt.c_str(), on_delta, on_done, on_error, user);
+}
+
 } // extern "C"

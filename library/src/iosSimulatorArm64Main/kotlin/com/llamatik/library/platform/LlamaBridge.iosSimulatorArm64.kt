@@ -14,16 +14,22 @@ import com.llamatik.library.platform.llama.llama_generate_chat
 import com.llamatik.library.platform.llama.llama_generate_chat_stream
 import com.llamatik.library.platform.llama.llama_generate_free
 import com.llamatik.library.platform.llama.llama_generate_init
+import com.llamatik.library.platform.llama.llama_generate_messages_stream
 import com.llamatik.library.platform.llama.llama_generate_set_params
 import com.llamatik.library.platform.llama.llama_generate_stream
 import kotlinx.cinterop.BetaInteropApi
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
+import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.StableRef
+import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.asStableRef
+import kotlinx.cinterop.cstr
 import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.set
 import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
 import org.jetbrains.compose.resources.ExperimentalResourceApi
@@ -248,5 +254,54 @@ actual object LlamaBridge {
             topK,
             repeatPenalty
         )
+    }
+
+    actual fun generateStreamWithMessages(messages: List<ChatTemplateMessage>, callback: GenStream) {
+        memScoped {
+            val ref = StableRef.create(callback)
+            val onDelta = staticCFunction { cstr: CPointer<ByteVar>?, ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                val s = cstr?.toKString() ?: return@staticCFunction
+                cb.onDelta(s)
+            }
+            val onDone = staticCFunction { ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                cb.onComplete()
+            }
+            val onError = staticCFunction { cstr: CPointer<ByteVar>?, ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                val msg = cstr?.toKString() ?: "unknown error"
+                cb.onError(msg)
+            }
+            try {
+                // Convert messages to C arrays using cstr which allocates in memScoped
+                val n = messages.size
+
+                // Allocate arrays of pointers
+                val roles = allocArray<CPointerVar<ByteVar>>(n)
+                val contents = allocArray<CPointerVar<ByteVar>>(n)
+
+                // Store the cstr pointers - cstr allocates in memScoped context
+                for (i in 0 until n) {
+                    val msg = messages[i]
+                    val rolePtr = msg.role.cstr.getPointer(this)
+                    val contentPtr = msg.content.cstr.getPointer(this)
+                    roles[i] = rolePtr
+                    contents[i] = contentPtr
+                }
+
+                llama_generate_messages_stream(
+                    roles,
+                    contents,
+                    n,
+                    onDelta,
+                    onDone,
+                    onError,
+                    ref.asCPointer()
+                )
+            } finally {
+                ref.dispose()
+            }
+        }
     }
 }

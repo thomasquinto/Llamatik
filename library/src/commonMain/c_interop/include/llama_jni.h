@@ -11,6 +11,20 @@ char *llama_generate(const char *prompt);
 void llama_generate_free();
 void llama_free_cstr(char *p);
 
+// Streaming callback types (iOS)
+typedef void (*llm_on_delta)(const char *utf8, void *user);
+typedef void (*llm_on_done)(void *user);
+typedef void (*llm_on_error)(const char *utf8, void *user);
+
+// Chat template streaming with message array (iOS)
+void llama_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user);
+
 #ifdef __cplusplus
 }
 #endif

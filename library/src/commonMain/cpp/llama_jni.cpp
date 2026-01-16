@@ -885,3 +885,153 @@ Java_com_llamatik_library_platform_LlamaBridge_nativeUpdateGenerationParams(
     g_repeat_penalty  = repeatPenalty;
     g_max_new_tokens  = (int)maxTokens;
 }
+
+// ===================================================================================
+//                    CHAT TEMPLATE STREAMING (Message Array API)
+// ===================================================================================
+
+/**
+ * Build a prompt using llama.cpp's chat template system.
+ * Uses the model's embedded template if available, otherwise falls back to ChatML.
+ *
+ * @param messages Vector of {role, content} pairs
+ * @return Formatted prompt string ready for tokenization
+ */
+static std::string build_chat_template_prompt(const std::vector<llama_chat_message> &messages) {
+    if (!gen_model) {
+        LOGE("build_chat_template_prompt: model not loaded");
+        return "";
+    }
+
+    // Get the model's embedded chat template (may be nullptr)
+    const char *model_template = llama_model_chat_template(gen_model, nullptr);
+
+    if (model_template) {
+        LOGI("Using model's embedded chat template");
+    } else {
+        LOGI("Model has no embedded template, using ChatML fallback");
+    }
+
+    // Estimate buffer size: 2x total content length + overhead for template tokens
+    size_t total_content_len = 0;
+    for (const auto &msg : messages) {
+        total_content_len += std::strlen(msg.role) + std::strlen(msg.content);
+    }
+    size_t buf_size = std::max(total_content_len * 3 + 256, (size_t)4096);
+
+    std::vector<char> buf(buf_size);
+
+    // Apply the chat template
+    // If model_template is nullptr, llama_chat_apply_template will use ChatML as default
+    int32_t result = llama_chat_apply_template(
+            model_template,
+            messages.data(),
+            messages.size(),
+            true,  // add_ass: add assistant turn start tokens
+            buf.data(),
+            (int32_t)buf.size()
+    );
+
+    if (result < 0) {
+        LOGE("llama_chat_apply_template failed with error %d", result);
+        return "";
+    }
+
+    // If buffer was too small, resize and retry
+    if ((size_t)result > buf.size()) {
+        buf.resize(result + 1);
+        result = llama_chat_apply_template(
+                model_template,
+                messages.data(),
+                messages.size(),
+                true,
+                buf.data(),
+                (int32_t)buf.size()
+        );
+        if (result < 0) {
+            LOGE("llama_chat_apply_template retry failed with error %d", result);
+            return "";
+        }
+    }
+
+    std::string prompt(buf.data(), result);
+    LOGD("Chat template prompt (%d chars): %.100s...", result, prompt.c_str());
+    return prompt;
+}
+
+/**
+ * JNI: Stream generation using chat template with message array.
+ *
+ * @param jRoles Array of role strings ("system", "user", "assistant")
+ * @param jContents Array of content strings (message text)
+ * @param jCallback GenStream callback object
+ */
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateWithMessagesStream(
+        JNIEnv *env, jobject /*thiz*/,
+        jobjectArray jRoles, jobjectArray jContents, jobject jCallback) {
+    if (!jCallback || !jRoles || !jContents) {
+        LOGE("nativeGenerateWithMessagesStream: null arguments");
+        return;
+    }
+
+    StreamMethods m{};
+    if (!resolve_stream_methods(env, jCallback, m)) {
+        LOGE("nativeGenerateWithMessagesStream: failed to resolve callback methods");
+        return;
+    }
+
+    jsize n_messages = env->GetArrayLength(jRoles);
+    jsize n_contents = env->GetArrayLength(jContents);
+
+    if (n_messages != n_contents) {
+        env->CallVoidMethod(jCallback, m.onError,
+                env->NewStringUTF("roles and contents arrays must have same length"));
+        return;
+    }
+
+    if (n_messages == 0) {
+        env->CallVoidMethod(jCallback, m.onError,
+                env->NewStringUTF("messages array is empty"));
+        return;
+    }
+
+    // Build the messages vector
+    std::vector<llama_chat_message> messages;
+    std::vector<std::string> role_strings;    // Keep strings alive
+    std::vector<std::string> content_strings;
+    messages.reserve(n_messages);
+    role_strings.reserve(n_messages);
+    content_strings.reserve(n_messages);
+
+    for (jsize i = 0; i < n_messages; i++) {
+        jstring jRole = (jstring)env->GetObjectArrayElement(jRoles, i);
+        jstring jContent = (jstring)env->GetObjectArrayElement(jContents, i);
+
+        const char *role_cstr = jRole ? env->GetStringUTFChars(jRole, nullptr) : nullptr;
+        const char *content_cstr = jContent ? env->GetStringUTFChars(jContent, nullptr) : nullptr;
+
+        role_strings.emplace_back(role_cstr ? role_cstr : "user");
+        content_strings.emplace_back(content_cstr ? content_cstr : "");
+
+        if (jRole && role_cstr) env->ReleaseStringUTFChars(jRole, role_cstr);
+        if (jContent && content_cstr) env->ReleaseStringUTFChars(jContent, content_cstr);
+
+        messages.push_back({role_strings.back().c_str(), content_strings.back().c_str()});
+    }
+
+    LOGI("nativeGenerateWithMessagesStream: %d messages", (int)messages.size());
+
+    // Build prompt using chat template
+    std::string prompt = build_chat_template_prompt(messages);
+
+    if (prompt.empty()) {
+        env->CallVoidMethod(jCallback, m.onError,
+                env->NewStringUTF("failed to build chat template prompt"));
+        return;
+    }
+
+    // Stream from the templated prompt
+    stream_from_prompt(env, prompt.c_str(), jCallback, m);
+}
