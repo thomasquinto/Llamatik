@@ -50,7 +50,8 @@ kotlin {
             val out = providers.exec { commandLine("which", name) }
                 .standardOutput.asText.get().trim()
             if (out.isNotEmpty() && file(out).canExecute()) return out
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
         for (p in candidates) if (file(p).canExecute()) return p
         throw GradleException(
             "Cannot find required tool '$name'. " +
@@ -132,6 +133,8 @@ kotlin {
                 "$libPath/libllama_static.a",
                 "$libPath/llama-local-build/src/libllama.a",
                 "$libPath/llama-local-build/ggml/src/libggml.a",
+                "$libPath/llama-local-build/ggml/src/libggml-base.a",
+                "$libPath/llama-local-build/ggml/src/libggml-cpu.a",
                 "$libPath/llama-local-build/ggml/src/ggml-blas/libggml-blas.a",
                 "$libPath/llama-local-build/ggml/src/ggml-metal/libggml-metal.a"
             )
@@ -273,7 +276,8 @@ android {
                 arguments += "-DANDROID_PLATFORM=android-29"
                 // Vulkan GPU acceleration: set -Pllamatik.vulkan=true to enable
                 // Default is CPU-only which is faster on many devices
-                val enableVulkan = project.findProperty("llamatik.vulkan")?.toString()?.toBoolean() ?: false
+                val enableVulkan =
+                    project.findProperty("llamatik.vulkan")?.toString()?.toBoolean() ?: false
                 arguments += "-DLLAMATIK_ENABLE_VULKAN=${if (enableVulkan) "ON" else "OFF"}"
             }
         }
