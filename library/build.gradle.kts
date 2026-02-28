@@ -68,7 +68,7 @@ kotlin {
         Triple(iosArm64(), "arm64", "iPhoneOS"),
         Triple(iosSimulatorArm64(), "arm64", "iPhoneSimulator")
     ).forEach { (arch, archName, sdkName) ->
-        val cmakeBuildDir = buildDir.resolve("llama-cmake/$sdkName/${arch.name}")
+        val cmakeBuildDir = layout.buildDirectory.dir("llama-cmake/$sdkName/${arch.name}").get().asFile
         val buildTaskName = "buildLlamaCMake${arch.name.replaceFirstChar { it.uppercase() }}"
 
         tasks.register(buildTaskName, Exec::class) {
@@ -195,7 +195,7 @@ kotlin {
     // ---------- Desktop (macOS) JNI build for llama_jni ----------
 
     // This is where we'll output libllama_jni.dylib for desktop (via CMakeLists.txt)
-    val macJniBuildDir = buildDir.resolve("llama-jni/macos")
+    val macJniBuildDir = layout.buildDirectory.dir("llama-jni/macos").get().asFile
 
     val buildLlamaJniDesktop by tasks.registering(Exec::class) {
         group = "llama-native"

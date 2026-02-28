@@ -35,7 +35,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Llamatik"
-include(":composeApp")
-include(":shared")
-include(":backend")
+// Only include :library — the other modules (composeApp, shared, backend)
+// are not needed by consumers and shared's korge plugin triggers Gradle 9
+// deprecation warnings (setFileMode, getDependencyProject).
 include(":library")
