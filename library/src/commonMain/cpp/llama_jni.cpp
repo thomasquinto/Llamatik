@@ -443,21 +443,13 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     // UINT64_MAX is a special value that cancels any session
     g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
 
-    // Wait for any ongoing generation to complete (with timeout)
-    // This is critical to prevent use-after-free crashes
-    int wait_count = 0;
-    const int max_wait_ms = 5000; // 5 second timeout
-    const int sleep_ms = 10;
-    while (g_generation_in_progress.load(std::memory_order_acquire) && wait_count < (max_wait_ms / sleep_ms)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-        wait_count++;
-    }
+    // Acquire the generation mutex to ensure no generation is in progress
+    // and no new generation can start while we free resources.
+    // This replaces the polling loop which had a TOCTOU race:
+    // shutdown could free gen_ctx while stream_from_prompt was still using it.
+    std::lock_guard<std::mutex> lock(g_generation_mutex);
 
-    if (wait_count >= (max_wait_ms / sleep_ms)) {
-        LOGE("shutdown: WARNING - generation did not stop within timeout, proceeding anyway");
-    } else {
-        LOGI("shutdown: generation stopped after %d ms", wait_count * sleep_ms);
-    }
+    LOGI("shutdown: mutex acquired, freeing resources");
 
     if (emb_ctx) llama_free(emb_ctx);
     if (emb_model) llama_model_free(emb_model);
@@ -468,6 +460,8 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     if (gen_model) llama_model_free(gen_model);
     gen_ctx = nullptr;
     gen_model = nullptr;
+
+    g_generation_in_progress.store(false, std::memory_order_release);
 
     if (g_backend_inited) {
         llama_backend_free();
@@ -512,6 +506,19 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
         }
     }
 
+    // Free any existing generation context/model before re-initializing
+    // (prevents memory leak and use-after-free if called concurrently)
+    if (gen_ctx) {
+        LOGW("initGenerateModel: freeing existing gen_ctx before re-init");
+        llama_free(gen_ctx);
+        gen_ctx = nullptr;
+    }
+    if (gen_model) {
+        LOGW("initGenerateModel: freeing existing gen_model before re-init");
+        llama_model_free(gen_model);
+        gen_model = nullptr;
+    }
+
     llama_model_params mparams = llama_model_default_params();
     // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
     mparams.n_gpu_layers = 99;
@@ -542,6 +549,8 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, jstring input) {
+    LOGI("generate (non-streaming): starting");
+
     if (!gen_ctx || !gen_model) {
         LOGE("generate: ctx/model null");
         return nullptr;
@@ -586,15 +595,22 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
         return nullptr;
     }
 
-    // NOTE: one-shot generate currently uses fixed sampler params (same as before).
-    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, 1.10f, 0.0f, 0.10f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(20));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.80f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.55f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    // Read params from atomics (set by updateGenerateParams from Kotlin)
+    float temperature    = g_temperature.load();
+    float top_p          = g_top_p.load();
+    int   top_k          = g_top_k.load();
+    float repeat_penalty = g_repeat_penalty.load();
+    int   max_new_tokens = g_max_new_tokens.load();
 
-    const int max_new_tokens = 640;
+    LOGI("generate (non-streaming): params temp=%.2f top_p=%.2f top_k=%d max_tokens=%d",
+         temperature, top_p, top_k, max_new_tokens);
+
+    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     int cur_pos = batch.n_tokens;
 
     std::string output;
@@ -637,6 +653,8 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
 
     llama_sampler_free(sampler);
     llama_batch_free(batch);
+
+    LOGI("generate (non-streaming): complete");
 
     std::string clean = sanitize_generation(output);
     return env->NewStringUTF(clean.c_str());
