@@ -27,6 +27,7 @@ set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../llama.cpp")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build llama as static library" FORCE)
 
 # Add llama.cpp's CMake (builds targets: ggml, ggml-blas, ggml-metal, llama, etc.)
+add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory(${LLAMA_CPP_DIR} llama-local-build EXCLUDE_FROM_ALL)
 
 # ---- Your wrapper -----------------------------------------------------------

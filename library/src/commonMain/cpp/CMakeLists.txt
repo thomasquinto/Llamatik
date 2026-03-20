@@ -45,6 +45,7 @@ if(ANDROID)
     endif()
 endif()
 
+add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory("${CMAKE_SOURCE_DIR}/../../../../llama.cpp/" "${CMAKE_BINARY_DIR}/llama")
 
 add_library(llama_jni SHARED

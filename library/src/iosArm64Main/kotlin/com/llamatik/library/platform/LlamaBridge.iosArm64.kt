@@ -146,7 +146,15 @@ actual object LlamaBridge {
         return out
     }
 
-    actual fun initGenerateModel(modelPath: String): Boolean = llama_generate_init(modelPath)
+    actual fun initGenerateModel(modelPath: String): Boolean {
+        val success = llama_generate_init(modelPath)
+        if (!success) {
+            val errorPtr = com.llamatik.library.platform.llama.llama_generate_last_error()
+            val errorMsg = errorPtr?.toKString() ?: "Failed to load model"
+            throw RuntimeException(errorMsg)
+        }
+        return true
+    }
 
     actual fun generate(prompt: String): String {
         val c = llama_generate(prompt) ?: return ""

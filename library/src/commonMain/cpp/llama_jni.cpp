@@ -62,6 +62,10 @@ static struct llama_context *gen_ctx = nullptr;
 // Backend lifetime
 static bool g_backend_inited = false;
 
+// Captures the last error message from llama.cpp for surfacing to the user
+static std::string g_last_error;
+static std::mutex g_last_error_mutex;
+
 // Llama log callback to redirect logs to Android logcat
 static void llama_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void)user_data;
@@ -74,9 +78,12 @@ static void llama_log_callback(enum ggml_log_level level, const char * text, voi
     if (msg.empty()) return;
 
     switch (level) {
-        case GGML_LOG_LEVEL_ERROR:
+        case GGML_LOG_LEVEL_ERROR: {
             LOGE("llama: %s", msg.c_str());
+            std::lock_guard<std::mutex> lock(g_last_error_mutex);
+            g_last_error = msg;
             break;
+        }
         case GGML_LOG_LEVEL_WARN:
             LOGW("llama: %s", msg.c_str());
             break;
@@ -519,6 +526,12 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
         gen_model = nullptr;
     }
 
+    // Clear last error before loading
+    {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        g_last_error.clear();
+    }
+
     llama_model_params mparams = llama_model_default_params();
     // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
     mparams.n_gpu_layers = 99;
@@ -528,6 +541,14 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
 
     if (!gen_model) {
         LOGE("gen model load failed");
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(g_last_error_mutex);
+            error = g_last_error;
+        }
+        if (error.empty()) error = "Failed to load model";
+        jclass exClass = env->FindClass("java/lang/RuntimeException");
+        env->ThrowNew(exClass, error.c_str());
         return JNI_FALSE;
     }
 
@@ -539,6 +560,8 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     if (!gen_ctx) {
         llama_model_free(gen_model);
         gen_model = nullptr;
+        jclass exClass = env->FindClass("java/lang/RuntimeException");
+        env->ThrowNew(exClass, "Failed to create model context");
         return JNI_FALSE;
     }
 

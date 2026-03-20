@@ -71,6 +71,12 @@ char *llama_generate_chat(const char *system_prompt,
  */
 void llama_generate_free(void);
 
+/**
+ * Get the last error message from model loading.
+ * Returns NULL if no error occurred.
+ */
+const char *llama_generate_last_error(void);
+
 // ================= Text Generation (streaming) =================
 //
 // These APIs stream tokens/deltas via callbacks and block until completion.

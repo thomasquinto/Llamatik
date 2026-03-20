@@ -42,6 +42,31 @@ static void dbg_printf(const char *fmt, ...) {
 #define DBG(fmt, ...) \
     do { dbg_printf("[ios] " fmt, ##__VA_ARGS__); } while (0)
 
+// ===================== Error capture =====================
+
+static std::string g_last_error;
+static std::mutex g_last_error_mutex;
+
+static void ios_log_callback(enum ggml_log_level level, const char *text, void *user_data) {
+    (void)user_data;
+    if (text == nullptr) return;
+    std::string msg(text);
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+        msg.pop_back();
+    }
+    if (msg.empty()) return;
+
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        g_last_error = msg;
+    }
+    // Always print to stderr for console/Xcode output
+    const char *lvl = (level == GGML_LOG_LEVEL_ERROR) ? "E" :
+                       (level == GGML_LOG_LEVEL_WARN)  ? "W" :
+                       (level == GGML_LOG_LEVEL_INFO)  ? "I" : "D";
+    std::fprintf(stderr, "[llama][%s] %s\n", lvl, msg.c_str());
+}
+
 // ===================== Global state =====================
 
 static struct llama_model   *model      = nullptr; // embeddings model
@@ -448,8 +473,15 @@ void llama_embed_free() {
 bool llama_generate_init(const char *model_path) {
     dbg_init();
     if (!g_backend_inited) {
+        llama_log_set(ios_log_callback, nullptr);
         llama_backend_init();
         g_backend_inited = true;
+    }
+
+    // Clear last error before loading
+    {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        g_last_error.clear();
     }
 
     gen_model = load_model_with_fallback(model_path);
@@ -467,6 +499,13 @@ bool llama_generate_init(const char *model_path) {
     }
     DBG("generate: n_ctx = %u", (unsigned)llama_n_ctx(gen_ctx));
     return true;
+}
+
+const char *llama_generate_last_error(void) {
+    std::lock_guard<std::mutex> lock(g_last_error_mutex);
+    if (g_last_error.empty()) return nullptr;
+    // Return pointer to static string - valid until next error
+    return g_last_error.c_str();
 }
 
 char *llama_generate(const char *prompt) {
