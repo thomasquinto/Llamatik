@@ -954,6 +954,16 @@ static std::string build_chat_template_prompt_ios(const char **roles,
         DBG("Model has no embedded template, using ChatML fallback");
     }
 
+    char arch_buf[64] = {};
+    const int32_t arch_len = llama_model_meta_val_str(
+            gen_model,
+            "general.architecture",
+            arch_buf,
+            (int32_t)sizeof(arch_buf)
+    );
+    const std::string architecture = arch_len > 0 ? std::string(arch_buf) : "";
+    const bool is_gemma_family = architecture.rfind("gemma", 0) == 0;
+
     // Estimate buffer size: 2x total content length + overhead for template tokens
     size_t total_content_len = 0;
     for (const auto &msg : messages) {
@@ -963,36 +973,54 @@ static std::string build_chat_template_prompt_ios(const char **roles,
 
     std::vector<char> buf(buf_size);
 
-    // Apply the chat template
-    int32_t result = llama_chat_apply_template(
-            model_template,
-            messages.data(),
-            messages.size(),
-            true,  // add_ass: add assistant turn start tokens
-            buf.data(),
-            (int32_t)buf.size()
-    );
-
-    if (result < 0) {
-        DBG("llama_chat_apply_template failed with error %d", result);
-        return "";
-    }
-
-    // If buffer was too small, resize and retry
-    if ((size_t)result > buf.size()) {
-        buf.resize(result + 1);
-        result = llama_chat_apply_template(
-                model_template,
+    auto apply_template = [&](const char *tmpl, const char *label) -> int32_t {
+        int32_t apply_result = llama_chat_apply_template(
+                tmpl,
                 messages.data(),
                 messages.size(),
-                true,
+                true,  // add_ass: add assistant turn start tokens
                 buf.data(),
                 (int32_t)buf.size()
         );
-        if (result < 0) {
-            DBG("llama_chat_apply_template retry failed with error %d", result);
-            return "";
+
+        if (apply_result < 0) {
+            DBG("llama_chat_apply_template failed for %s with error %d", label, apply_result);
+            return apply_result;
         }
+
+        if ((size_t)apply_result > buf.size()) {
+            buf.resize(apply_result + 1);
+            apply_result = llama_chat_apply_template(
+                    tmpl,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    buf.data(),
+                    (int32_t)buf.size()
+            );
+            if (apply_result < 0) {
+                DBG("llama_chat_apply_template retry failed for %s with error %d", label, apply_result);
+            }
+        }
+
+        return apply_result;
+    };
+
+    int32_t result = apply_template(model_template, model_template ? "embedded template" : "ChatML fallback");
+
+    if (result < 0 && model_template && is_gemma_family) {
+        DBG("Embedded chat template is not supported for %s; retrying with Gemma template", architecture.c_str());
+        result = apply_template("gemma", "Gemma fallback");
+    }
+
+    if (result < 0 && model_template && !is_gemma_family) {
+        DBG("Embedded chat template is not supported for %s; retrying with ChatML fallback", architecture.c_str());
+        result = apply_template(nullptr, "ChatML fallback");
+    }
+
+    if (result < 0) {
+        DBG("Unable to format chat prompt with embedded/default/fallback templates");
+        return "";
     }
 
     std::string prompt(buf.data(), result);
