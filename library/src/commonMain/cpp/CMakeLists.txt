@@ -48,6 +48,17 @@ endif()
 add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory("${CMAKE_SOURCE_DIR}/../../../../llama.cpp/" "${CMAKE_BINARY_DIR}/llama")
 
+set(MTMD_VIDEO OFF CACHE BOOL "Disable mtmd video support for mobile embedded builds" FORCE)
+set(MTMD_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
+if(NOT DEFINED LLAMA_INSTALL_VERSION)
+    set(LLAMA_INSTALL_VERSION 0.0.0)
+endif()
+add_subdirectory(
+        "${CMAKE_SOURCE_DIR}/../../../../llama.cpp/tools/mtmd"
+        "${CMAKE_BINARY_DIR}/mtmd"
+        EXCLUDE_FROM_ALL
+)
+
 add_library(llama_jni SHARED
         llama_jni.cpp
         llama_embed.cpp
@@ -60,4 +71,4 @@ target_include_directories(llama_jni PRIVATE
         ${CMAKE_SOURCE_DIR}/../c_interop/include
 )
 
-target_link_libraries(llama_jni llama ${log-lib})
+target_link_libraries(llama_jni llama mtmd ${log-lib})

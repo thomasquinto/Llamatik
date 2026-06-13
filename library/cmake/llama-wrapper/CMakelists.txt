@@ -30,6 +30,13 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build llama as static library" FORCE)
 add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory(${LLAMA_CPP_DIR} llama-local-build EXCLUDE_FROM_ALL)
 
+set(MTMD_VIDEO OFF CACHE BOOL "Disable mtmd video support for mobile embedded builds" FORCE)
+set(MTMD_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
+if(NOT DEFINED LLAMA_INSTALL_VERSION)
+    set(LLAMA_INSTALL_VERSION 0.0.0)
+endif()
+add_subdirectory(${LLAMA_CPP_DIR}/tools/mtmd mtmd-local-build EXCLUDE_FROM_ALL)
+
 # ---- Your wrapper -----------------------------------------------------------
 add_library(llama_static_wrapper STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/iosMain/cpp/llama_embed.cpp
@@ -40,6 +47,7 @@ target_include_directories(llama_static_wrapper PUBLIC
         ${LLAMA_CPP_DIR}/src
         ${LLAMA_CPP_DIR}/ggml
         ${LLAMA_CPP_DIR}/ggml/include
+        ${LLAMA_CPP_DIR}/tools/mtmd
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/iosMain/c_interop/include
 )
 
@@ -55,6 +63,7 @@ target_compile_features(llama_static_wrapper PUBLIC cxx_std_17)
 target_link_libraries(llama_static_wrapper
         PRIVATE
         llama
+        mtmd
         Threads::Threads
 )
 
@@ -71,6 +80,7 @@ set_target_properties(llama_static_wrapper PROPERTIES
 set(WRAPPER_LIB      $<TARGET_FILE:llama_static_wrapper>)
 set(LLAMA_LIB        $<TARGET_FILE:llama>)
 set(GGML_LIB         $<TARGET_FILE:ggml>)
+set(MTMD_LIB         $<TARGET_FILE:mtmd>)
 
 # These may or may not exist depending on your llama.cpp options; guard them:
 set(EXTRA_LIBS)
@@ -89,11 +99,13 @@ add_custom_command(
         ${WRAPPER_LIB}
         ${LLAMA_LIB}
         ${GGML_LIB}
+        ${MTMD_LIB}
         ${EXTRA_LIBS}
         DEPENDS
         llama_static_wrapper
         llama
         ggml
+        mtmd
         ${EXTRA_LIBS}
         VERBATIM
 )
