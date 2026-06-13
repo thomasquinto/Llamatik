@@ -32,6 +32,25 @@ expect object LlamaBridge {
      */
     fun generateStreamWithMessages(messages: List<ChatTemplateMessage>, callback: GenStream)
 
+    /**
+     * Whether this build exposes llama.cpp multimodal GGUF support.
+     */
+    fun isVisionAvailable(): Boolean
+
+    /**
+     * Initialize a base GGUF model with its matching multimodal projector GGUF.
+     */
+    fun initVisionModel(modelPath: String, projectionModelPath: String): Boolean
+
+    /**
+     * Generate streaming response from chat messages plus local image paths.
+     */
+    fun generateVisionStreamWithMessages(
+        messages: List<VisionChatTemplateMessage>,
+        imagePaths: List<String>,
+        callback: GenStream
+    )
+
     fun shutdown()
     fun nativeCancelGenerate()
     fun updateGenerateParams(
@@ -58,6 +77,14 @@ data class ChatTemplateMessage(
         fun assistant(content: String) = ChatTemplateMessage("assistant", content)
     }
 }
+
+/**
+ * Message shape used by llama.cpp multimodal generation.
+ */
+data class VisionChatTemplateMessage(
+    val role: String,
+    val content: String
+)
 
 interface GenStream {
     fun onDelta(text: String)

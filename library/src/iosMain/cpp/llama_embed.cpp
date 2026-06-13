@@ -1062,4 +1062,35 @@ void llama_generate_messages_stream(const char **roles,
     llama_generate_stream(prompt.c_str(), on_delta, on_done, on_error, user);
 }
 
+bool llama_vision_available(void) {
+    return false;
+}
+
+bool llama_vision_init(const char *model_path, const char *projection_model_path) {
+    (void)model_path;
+    (void)projection_model_path;
+    return false;
+}
+
+void llama_vision_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        const char **image_paths,
+        int n_images,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user) {
+    (void)roles;
+    (void)contents;
+    (void)n_messages;
+    (void)image_paths;
+    (void)n_images;
+    (void)on_delta;
+    (void)on_done;
+    if (on_error) {
+        on_error("llama.cpp vision runtime is not available in this build.", user);
+    }
+}
+
 } // extern "C"

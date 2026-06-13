@@ -25,6 +25,18 @@ void llama_generate_messages_stream(const char **roles,
         llm_on_error on_error,
         void *user);
 
+bool llama_vision_available(void);
+bool llama_vision_init(const char *model_path, const char *projection_model_path);
+void llama_vision_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        const char **image_paths,
+        int n_images,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user);
+
 #ifdef __cplusplus
 }
 #endif

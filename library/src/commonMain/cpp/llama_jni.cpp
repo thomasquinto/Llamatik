@@ -1154,3 +1154,101 @@ Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateWithMessagesStream(
     // Stream from the templated prompt
     stream_from_prompt(env, prompt.c_str(), jCallback, m);
 }
+
+extern "C"
+bool llama_vision_available(void) {
+    return false;
+}
+
+extern "C"
+bool llama_vision_init(const char *model_path, const char *projection_model_path) {
+    (void)model_path;
+    (void)projection_model_path;
+    return false;
+}
+
+extern "C"
+void llama_vision_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        const char **image_paths,
+        int n_images,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user) {
+    (void)roles;
+    (void)contents;
+    (void)n_messages;
+    (void)image_paths;
+    (void)n_images;
+    (void)on_delta;
+    (void)on_done;
+    if (on_error) {
+        on_error("llama.cpp vision runtime is not available in this build.", user);
+    }
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeIsVisionAvailable(
+        JNIEnv * /*env*/, jobject /*thiz*/) {
+    return llama_vision_available() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeInitVisionModel(
+        JNIEnv *env,
+        jobject /*thiz*/,
+        jstring jModelPath,
+        jstring jProjectionModelPath) {
+    const char *model_path = jModelPath ? env->GetStringUTFChars(jModelPath, nullptr) : nullptr;
+    const char *projection_model_path = jProjectionModelPath
+            ? env->GetStringUTFChars(jProjectionModelPath, nullptr)
+            : nullptr;
+
+    const bool success = llama_vision_init(model_path, projection_model_path);
+
+    if (jModelPath && model_path) {
+        env->ReleaseStringUTFChars(jModelPath, model_path);
+    }
+    if (jProjectionModelPath && projection_model_path) {
+        env->ReleaseStringUTFChars(jProjectionModelPath, projection_model_path);
+    }
+
+    return success ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateVisionWithMessagesStream(
+        JNIEnv *env,
+        jobject /*thiz*/,
+        jobjectArray jRoles,
+        jobjectArray jContents,
+        jobjectArray jImagePaths,
+        jobject jCallback) {
+    if (!jCallback || !jRoles || !jContents || !jImagePaths) {
+        LOGE("nativeGenerateVisionWithMessagesStream: null arguments");
+        return;
+    }
+
+    StreamMethods m{};
+    if (!resolve_stream_methods(env, jCallback, m)) {
+        LOGE("nativeGenerateVisionWithMessagesStream: failed to resolve callback methods");
+        return;
+    }
+
+    jsize n_messages = env->GetArrayLength(jRoles);
+    jsize n_contents = env->GetArrayLength(jContents);
+
+    if (n_messages != n_contents) {
+        env->CallVoidMethod(jCallback, m.onError,
+                env->NewStringUTF("roles and contents arrays must have same length"));
+        return;
+    }
+
+    env->CallVoidMethod(jCallback, m.onError,
+            env->NewStringUTF("llama.cpp vision runtime is not available in this build."));
+}

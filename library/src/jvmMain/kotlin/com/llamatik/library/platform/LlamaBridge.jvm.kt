@@ -117,6 +117,18 @@ actual object LlamaBridge {
         nativeGenerateWithMessagesStream(roles, contents, callback)
     }
 
+    actual fun isVisionAvailable(): Boolean = false
+
+    actual fun initVisionModel(modelPath: String, projectionModelPath: String): Boolean = false
+
+    actual fun generateVisionStreamWithMessages(
+        messages: List<VisionChatTemplateMessage>,
+        imagePaths: List<String>,
+        callback: GenStream
+    ) {
+        callback.onError("llama.cpp vision runtime is not available in this build.")
+    }
+
     // These must exist as:
     // Java_com_llamatik_library_platform_LlamaBridge_shutdown
     // Java_com_llamatik_library_platform_LlamaBridge_nativeCancelGenerate

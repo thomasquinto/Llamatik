@@ -152,6 +152,31 @@ void llama_generate_messages_stream(const char **roles,
         llm_on_error on_error,
         void *user);
 
+/**
+ * Returns whether this native build exposes llama.cpp multimodal GGUF support.
+ */
+bool llama_vision_available(void);
+
+/**
+ * Initialize a base language model GGUF and matching projector GGUF.
+ */
+bool llama_vision_init(const char *model_path, const char *projection_model_path);
+
+/**
+ * Stream generation using chat messages and local image file paths.
+ *
+ * NOTE: This call is synchronous/blocking; invoke off the main thread.
+ */
+void llama_vision_generate_messages_stream(const char **roles,
+        const char **contents,
+        int n_messages,
+        const char **image_paths,
+        int n_images,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

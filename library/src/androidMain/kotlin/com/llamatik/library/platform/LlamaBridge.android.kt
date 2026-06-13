@@ -6,8 +6,15 @@ import java.io.File
 
 @Suppress("EXPECT_ACTUAL_CLASSIFIERS_ARE_IN_BETA_WARNING")
 actual object LlamaBridge {
+    private var nativeLibraryLoaded: Boolean = false
+
     init {
-        System.loadLibrary("llama_jni") // Only here, where System exists
+        nativeLibraryLoaded = try {
+            System.loadLibrary("llama_jni") // Only here, where System exists
+            true
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        }
     }
 
     actual external fun initModel(modelPath: String): Boolean
@@ -89,10 +96,41 @@ actual object LlamaBridge {
         callback: GenStream
     )
 
+    private external fun nativeIsVisionAvailable(): Boolean
+    private external fun nativeInitVisionModel(modelPath: String, projectionModelPath: String): Boolean
+    private external fun nativeGenerateVisionWithMessagesStream(
+        roles: Array<String>,
+        contents: Array<String>,
+        imagePaths: Array<String>,
+        callback: GenStream
+    )
+
     actual fun generateStreamWithMessages(messages: List<ChatTemplateMessage>, callback: GenStream) {
         val roles = messages.map { it.role }.toTypedArray()
         val contents = messages.map { it.content }.toTypedArray()
         nativeGenerateWithMessagesStream(roles, contents, callback)
+    }
+
+    actual fun isVisionAvailable(): Boolean {
+        return nativeLibraryLoaded && nativeIsVisionAvailable()
+    }
+
+    actual fun initVisionModel(modelPath: String, projectionModelPath: String): Boolean {
+        return nativeLibraryLoaded && nativeInitVisionModel(modelPath, projectionModelPath)
+    }
+
+    actual fun generateVisionStreamWithMessages(
+        messages: List<VisionChatTemplateMessage>,
+        imagePaths: List<String>,
+        callback: GenStream
+    ) {
+        if (!nativeLibraryLoaded) {
+            callback.onError("llama.cpp native library is not available in this build.")
+            return
+        }
+        val roles = messages.map { it.role }.toTypedArray()
+        val contents = messages.map { it.content }.toTypedArray()
+        nativeGenerateVisionWithMessagesStream(roles, contents, imagePaths.toTypedArray(), callback)
     }
 
     actual external fun shutdown()

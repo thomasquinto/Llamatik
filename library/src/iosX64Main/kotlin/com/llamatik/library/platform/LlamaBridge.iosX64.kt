@@ -17,6 +17,9 @@ import com.llamatik.library.platform.llama.llama_generate_init
 import com.llamatik.library.platform.llama.llama_generate_messages_stream
 import com.llamatik.library.platform.llama.llama_generate_set_params
 import com.llamatik.library.platform.llama.llama_generate_stream
+import com.llamatik.library.platform.llama.llama_vision_available
+import com.llamatik.library.platform.llama.llama_vision_generate_messages_stream
+import com.llamatik.library.platform.llama.llama_vision_init
 import kotlinx.cinterop.BetaInteropApi
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.COpaquePointer
@@ -29,6 +32,7 @@ import kotlinx.cinterop.cstr
 import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.reinterpret
+import kotlinx.cinterop.set
 import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
 import org.jetbrains.compose.resources.ExperimentalResourceApi
@@ -295,6 +299,66 @@ actual object LlamaBridge {
                     roles.reinterpret(),
                     contents.reinterpret(),
                     n,
+                    onDelta,
+                    onDone,
+                    onError,
+                    ref.asCPointer()
+                )
+            } finally {
+                ref.dispose()
+            }
+        }
+    }
+
+    actual fun isVisionAvailable(): Boolean = llama_vision_available()
+
+    actual fun initVisionModel(modelPath: String, projectionModelPath: String): Boolean {
+        return llama_vision_init(modelPath, projectionModelPath)
+    }
+
+    actual fun generateVisionStreamWithMessages(
+        messages: List<VisionChatTemplateMessage>,
+        imagePaths: List<String>,
+        callback: GenStream
+    ) {
+        memScoped {
+            val ref = StableRef.create(callback)
+            val onDelta = staticCFunction { cstr: CPointer<ByteVar>?, ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                val s = cstr?.toKString() ?: return@staticCFunction
+                cb.onDelta(s)
+            }
+            val onDone = staticCFunction { ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                cb.onComplete()
+            }
+            val onError = staticCFunction { cstr: CPointer<ByteVar>?, ud: COpaquePointer? ->
+                val cb = ud!!.asStableRef<GenStream>().get()
+                val msg = cstr?.toKString() ?: "unknown error"
+                cb.onError(msg)
+            }
+            try {
+                val n = messages.size
+                val roles = allocArray<CPointerVar<ByteVar>>(n)
+                val contents = allocArray<CPointerVar<ByteVar>>(n)
+                for (i in 0 until n) {
+                    val msg = messages[i]
+                    roles[i] = msg.role.cstr.getPointer(this)
+                    contents[i] = msg.content.cstr.getPointer(this)
+                }
+
+                val imageCount = imagePaths.size
+                val imagePathPointers = allocArray<CPointerVar<ByteVar>>(imageCount)
+                for (i in 0 until imageCount) {
+                    imagePathPointers[i] = imagePaths[i].cstr.getPointer(this)
+                }
+
+                llama_vision_generate_messages_stream(
+                    roles.reinterpret(),
+                    contents.reinterpret(),
+                    n,
+                    imagePathPointers.reinterpret(),
+                    imageCount,
                     onDelta,
                     onDone,
                     onError,
