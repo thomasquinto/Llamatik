@@ -2,6 +2,8 @@
 #include "llama.h"
 #include "llama_jni.h"
 #include "ggml-backend.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <string>
 #include <sstream>
@@ -16,6 +18,8 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <memory>
+#include <utility>
 
 // ===================================================================================
 //                              PLATFORM LOGGING
@@ -58,6 +62,7 @@ static int emb_dim = 0;
 // Text generation
 static struct llama_model *gen_model = nullptr;
 static struct llama_context *gen_ctx = nullptr;
+static struct mtmd_context *vision_ctx = nullptr;
 
 // Backend lifetime
 static bool g_backend_inited = false;
@@ -465,8 +470,10 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
 
     if (gen_ctx) llama_free(gen_ctx);
     if (gen_model) llama_model_free(gen_model);
+    if (vision_ctx) mtmd_free(vision_ctx);
     gen_ctx = nullptr;
     gen_model = nullptr;
+    vision_ctx = nullptr;
 
     g_generation_in_progress.store(false, std::memory_order_release);
 
@@ -515,6 +522,11 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
 
     // Free any existing generation context/model before re-initializing
     // (prevents memory leak and use-after-free if called concurrently)
+    if (vision_ctx) {
+        LOGW("initGenerateModel: freeing existing vision_ctx before re-init");
+        mtmd_free(vision_ctx);
+        vision_ctx = nullptr;
+    }
     if (gen_ctx) {
         LOGW("initGenerateModel: freeing existing gen_ctx before re-init");
         llama_free(gen_ctx);
@@ -1157,14 +1169,174 @@ Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateWithMessagesStream(
 
 extern "C"
 bool llama_vision_available(void) {
-    return false;
+    return true;
 }
 
 extern "C"
 bool llama_vision_init(const char *model_path, const char *projection_model_path) {
-    (void)model_path;
-    (void)projection_model_path;
-    return false;
+    if (!model_path || !projection_model_path) {
+        LOGE("llama_vision_init: missing model or projection path");
+        return false;
+    }
+
+    if (!g_backend_inited) {
+        llama_log_set(llama_log_callback, nullptr);
+        llama_backend_init();
+        g_backend_inited = true;
+    }
+
+    if (!gen_model || !gen_ctx) {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = 99;
+        gen_model = llama_model_load_from_file(model_path, mparams);
+        if (!gen_model) {
+            LOGE("llama_vision_init: failed to load base model");
+            return false;
+        }
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.embeddings = false;
+        cparams.n_ctx = 4096;
+        gen_ctx = llama_init_from_model(gen_model, cparams);
+        if (!gen_ctx) {
+            LOGE("llama_vision_init: failed to create base model context");
+            llama_model_free(gen_model);
+            gen_model = nullptr;
+            return false;
+        }
+    }
+
+    if (vision_ctx) {
+        mtmd_free(vision_ctx);
+        vision_ctx = nullptr;
+    }
+
+    mtmd_context_params mparams = mtmd_context_params_default();
+    mparams.use_gpu = true;
+    mparams.print_timings = false;
+    mparams.n_threads = std::max(1u, std::thread::hardware_concurrency());
+    vision_ctx = mtmd_init_from_file(projection_model_path, gen_model, mparams);
+    if (!vision_ctx) {
+        LOGE("llama_vision_init: failed to load projector");
+        return false;
+    }
+
+    if (!mtmd_support_vision(vision_ctx)) {
+        LOGE("llama_vision_init: projector does not report vision support");
+        mtmd_free(vision_ctx);
+        vision_ctx = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+static void vision_stream_from_pos(
+        uint64_t session_id,
+        llama_pos start_pos,
+        llm_on_delta on_delta,
+        llm_on_done on_done,
+        llm_on_error on_error,
+        void *user) {
+    const float temperature = g_temperature.load();
+    const float top_p = g_top_p.load();
+    const int top_k = g_top_k.load();
+    const float repeat_penalty = g_repeat_penalty.load();
+    const int max_new_tokens = g_max_new_tokens.load();
+
+    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (!sampler) {
+        if (on_error) on_error("sampler init failed", user);
+        return;
+    }
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    const llama_vocab *vocab = llama_model_get_vocab(gen_model);
+    const int n_ctx = (int)llama_n_ctx(gen_ctx);
+    int cur_pos = (int)start_pos;
+    char piece_buf[768];
+    char spec_buf[64];
+
+    for (int i = 0; i < max_new_tokens; ++i) {
+        if (should_cancel_session(session_id)) break;
+
+        llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
+        if (tok < 0 || llama_vocab_is_eog(vocab, tok)) break;
+
+        int sn = llama_token_to_piece(vocab, tok, spec_buf, (int)sizeof(spec_buf), 0, 1);
+        if (sn > 0) {
+            spec_buf[std::min(sn, (int)sizeof(spec_buf) - 1)] = '\0';
+            if (is_eot_piece(spec_buf) || std::strcmp(spec_buf, "<start_of_turn>") == 0) break;
+        }
+
+        llama_sampler_accept(sampler, tok);
+
+        int nn = llama_token_to_piece(vocab, tok, piece_buf, (int)sizeof(piece_buf), 0, 0);
+        if (nn > 0 && on_delta) {
+            piece_buf[std::min(nn, (int)sizeof(piece_buf) - 1)] = '\0';
+            on_delta(piece_buf, user);
+        }
+
+        if (cur_pos >= n_ctx) break;
+
+        llama_batch step = llama_batch_init(1, 0, 1);
+        step.n_tokens = 1;
+        step.token[0] = tok;
+        step.pos[0] = cur_pos++;
+        step.n_seq_id[0] = 1;
+        step.seq_id[0][0] = 0;
+        step.logits[0] = true;
+
+        if (llama_decode(gen_ctx, step) != 0) {
+            llama_batch_free(step);
+            llama_sampler_free(sampler);
+            if (on_error) on_error("llama_decode failed mid-stream", user);
+            return;
+        }
+        llama_batch_free(step);
+    }
+
+    llama_sampler_free(sampler);
+    if (on_done) on_done(user);
+}
+
+static std::string build_vision_prompt(const char **roles, const char **contents, int n_messages, int n_images) {
+    std::vector<std::string> role_strings;
+    std::vector<std::string> content_strings;
+    std::vector<llama_chat_message> messages;
+    role_strings.reserve(n_messages);
+    content_strings.reserve(n_messages);
+    messages.reserve(n_messages);
+
+    int marker_target = -1;
+    for (int i = n_messages - 1; i >= 0; --i) {
+        if (roles[i] && std::strcmp(roles[i], "user") == 0) {
+            marker_target = i;
+            break;
+        }
+    }
+    if (marker_target < 0 && n_messages > 0) marker_target = n_messages - 1;
+
+    const char *marker = mtmd_get_marker(vision_ctx);
+    if (!marker) marker = mtmd_default_marker();
+
+    for (int i = 0; i < n_messages; ++i) {
+        role_strings.emplace_back(roles[i] ? roles[i] : "user");
+        content_strings.emplace_back(contents[i] ? contents[i] : "");
+        if (i == marker_target) {
+            for (int image_index = 0; image_index < n_images; ++image_index) {
+                if (!content_strings.back().empty()) content_strings.back().append("\n");
+                content_strings.back().append(marker);
+            }
+        }
+        messages.push_back({role_strings.back().c_str(), content_strings.back().c_str()});
+    }
+
+    return build_chat_template_prompt(messages);
 }
 
 extern "C"
@@ -1177,16 +1349,99 @@ void llama_vision_generate_messages_stream(const char **roles,
         llm_on_done on_done,
         llm_on_error on_error,
         void *user) {
-    (void)roles;
-    (void)contents;
-    (void)n_messages;
-    (void)image_paths;
-    (void)n_images;
-    (void)on_delta;
-    (void)on_done;
-    if (on_error) {
-        on_error("llama.cpp vision runtime is not available in this build.", user);
+    std::lock_guard<std::mutex> lock(g_generation_mutex);
+    const uint64_t session_id = ++g_generation_session_id;
+
+    if (!gen_ctx || !gen_model || !vision_ctx) {
+        if (on_error) on_error("vision model not initialized", user);
+        return;
     }
+    if (!roles || !contents || n_messages <= 0) {
+        if (on_error) on_error("invalid arguments: roles, contents, or n_messages", user);
+        return;
+    }
+    if (!image_paths || n_images <= 0) {
+        if (on_error) on_error("vision generation requires at least one image", user);
+        return;
+    }
+
+    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
+    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
+        g_cancel_session_id.store(0, std::memory_order_relaxed);
+    }
+
+    g_generation_in_progress.store(true, std::memory_order_release);
+    llama_memory_clear(llama_get_memory(gen_ctx), true);
+
+    std::vector<mtmd_bitmap *> bitmaps;
+    std::vector<const mtmd_bitmap *> bitmap_refs;
+    bitmaps.reserve(n_images);
+    bitmap_refs.reserve(n_images);
+    for (int i = 0; i < n_images; ++i) {
+        auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false);
+        if (!bitmap.bitmap) {
+            for (mtmd_bitmap *loaded : bitmaps) mtmd_bitmap_free(loaded);
+            g_generation_in_progress.store(false, std::memory_order_release);
+            if (on_error) on_error("failed to load image", user);
+            return;
+        }
+        bitmaps.push_back(bitmap.bitmap);
+        bitmap_refs.push_back(bitmap.bitmap);
+        if (bitmap.video_ctx) {
+            mtmd_helper_video_free(bitmap.video_ctx);
+        }
+    }
+
+    std::string prompt = build_vision_prompt(roles, contents, n_messages, n_images);
+    if (prompt.empty()) {
+        for (mtmd_bitmap *bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+        g_generation_in_progress.store(false, std::memory_order_release);
+        if (on_error) on_error("failed to build chat template prompt", user);
+        return;
+    }
+
+    mtmd_input_text text{};
+    text.text = prompt.c_str();
+    text.add_special = true;
+    text.parse_special = true;
+
+    mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+    int32_t tokenize_result = mtmd_tokenize(
+            vision_ctx,
+            chunks,
+            &text,
+            bitmap_refs.empty() ? nullptr : bitmap_refs.data(),
+            bitmap_refs.size());
+
+    for (mtmd_bitmap *bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+
+    if (tokenize_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        g_generation_in_progress.store(false, std::memory_order_release);
+        if (on_error) on_error("failed to tokenize multimodal prompt", user);
+        return;
+    }
+
+    llama_pos new_n_past = 0;
+    int32_t eval_result = mtmd_helper_eval_chunks(
+            vision_ctx,
+            gen_ctx,
+            chunks,
+            0,
+            0,
+            512,
+            true,
+            &new_n_past);
+    mtmd_input_chunks_free(chunks);
+
+    if (eval_result != 0) {
+        g_generation_in_progress.store(false, std::memory_order_release);
+        if (on_error) on_error("failed to evaluate multimodal prompt", user);
+        return;
+    }
+
+    vision_stream_from_pos(session_id, new_n_past, on_delta, on_done, on_error, user);
+    g_generation_in_progress.store(false, std::memory_order_release);
 }
 
 extern "C"
@@ -1249,6 +1504,82 @@ Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateVisionWithMessagesS
         return;
     }
 
-    env->CallVoidMethod(jCallback, m.onError,
-            env->NewStringUTF("llama.cpp vision runtime is not available in this build."));
+    jsize n_images = env->GetArrayLength(jImagePaths);
+
+    std::vector<std::string> role_strings;
+    std::vector<std::string> content_strings;
+    std::vector<std::string> image_path_strings;
+    std::vector<const char *> roles;
+    std::vector<const char *> contents;
+    std::vector<const char *> image_paths;
+    role_strings.reserve(n_messages);
+    content_strings.reserve(n_messages);
+    image_path_strings.reserve(n_images);
+    roles.reserve(n_messages);
+    contents.reserve(n_messages);
+    image_paths.reserve(n_images);
+
+    for (jsize i = 0; i < n_messages; i++) {
+        jstring jRole = (jstring)env->GetObjectArrayElement(jRoles, i);
+        jstring jContent = (jstring)env->GetObjectArrayElement(jContents, i);
+
+        const char *role_cstr = jRole ? env->GetStringUTFChars(jRole, nullptr) : nullptr;
+        const char *content_cstr = jContent ? env->GetStringUTFChars(jContent, nullptr) : nullptr;
+
+        role_strings.emplace_back(role_cstr ? role_cstr : "user");
+        content_strings.emplace_back(content_cstr ? content_cstr : "");
+
+        if (jRole && role_cstr) env->ReleaseStringUTFChars(jRole, role_cstr);
+        if (jContent && content_cstr) env->ReleaseStringUTFChars(jContent, content_cstr);
+        if (jRole) env->DeleteLocalRef(jRole);
+        if (jContent) env->DeleteLocalRef(jContent);
+    }
+
+    for (jsize i = 0; i < n_images; i++) {
+        jstring jImagePath = (jstring)env->GetObjectArrayElement(jImagePaths, i);
+        const char *image_path_cstr = jImagePath ? env->GetStringUTFChars(jImagePath, nullptr) : nullptr;
+        image_path_strings.emplace_back(image_path_cstr ? image_path_cstr : "");
+        if (jImagePath && image_path_cstr) env->ReleaseStringUTFChars(jImagePath, image_path_cstr);
+        if (jImagePath) env->DeleteLocalRef(jImagePath);
+    }
+
+    for (const std::string &role : role_strings) roles.push_back(role.c_str());
+    for (const std::string &content : content_strings) contents.push_back(content.c_str());
+    for (const std::string &image_path : image_path_strings) image_paths.push_back(image_path.c_str());
+
+    std::pair<JNIEnv *, jobject> callback_context(env, jCallback);
+    llama_vision_generate_messages_stream(
+            roles.data(),
+            contents.data(),
+            (int)n_messages,
+            image_paths.data(),
+            (int)n_images,
+            [](const char *utf8, void *user_data) {
+                auto *ctx = static_cast<std::pair<JNIEnv *, jobject> *>(user_data);
+                StreamMethods methods{};
+                if (!resolve_stream_methods(ctx->first, ctx->second, methods)) return;
+                jstring delta = ctx->first->NewStringUTF(utf8 ? utf8 : "");
+                if (delta) {
+                    ctx->first->CallVoidMethod(ctx->second, methods.onDelta, delta);
+                    ctx->first->DeleteLocalRef(delta);
+                }
+            },
+            [](void *user_data) {
+                auto *ctx = static_cast<std::pair<JNIEnv *, jobject> *>(user_data);
+                StreamMethods methods{};
+                if (resolve_stream_methods(ctx->first, ctx->second, methods)) {
+                    ctx->first->CallVoidMethod(ctx->second, methods.onComplete);
+                }
+            },
+            [](const char *utf8, void *user_data) {
+                auto *ctx = static_cast<std::pair<JNIEnv *, jobject> *>(user_data);
+                StreamMethods methods{};
+                if (!resolve_stream_methods(ctx->first, ctx->second, methods)) return;
+                jstring error = ctx->first->NewStringUTF(utf8 ? utf8 : "vision generation failed");
+                if (error) {
+                    ctx->first->CallVoidMethod(ctx->second, methods.onError, error);
+                    ctx->first->DeleteLocalRef(error);
+                }
+            },
+            &callback_context);
 }
