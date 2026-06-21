@@ -1281,8 +1281,8 @@ void llama_vision_generate_messages_stream(const char **roles,
         if (on_error) on_error("invalid arguments: roles, contents, or n_messages", user);
         return;
     }
-    if (!image_paths || n_images <= 0) {
-        if (on_error) on_error("vision generation requires at least one image", user);
+    if (n_images < 0 || (n_images > 0 && !image_paths)) {
+        if (on_error) on_error("invalid image arguments", user);
         return;
     }
 
