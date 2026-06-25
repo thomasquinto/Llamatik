@@ -153,6 +153,15 @@ kotlin {
                 defFile("src/iosMain/c_interop/$defFileName")
                 packageName("com.llamatik.library.platform.llama")
                 compilerOpts("-I${projectDir}/src/iosMain/c_interop/include")
+                linkerOpts(
+                    "-L$libPath",
+                    "-force_load", "$libPath/libllama_merged.a",
+                    "-force_load", "$libPath/mtmd-local-build/libmtmd.a",
+                    "-framework", "Accelerate",
+                    "-framework", "Metal",
+                    "-lc++",
+                    "-ObjC"
+                )
                 tasks.named(interopProcessingTaskName).configure {
                     dependsOn(compileTask)
                 }
