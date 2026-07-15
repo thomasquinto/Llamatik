@@ -743,6 +743,37 @@ static inline bool is_eot_piece(const char *s) {
     return std::strcmp(s, "<end_of_turn>") == 0 || std::strcmp(s, "<|eot_id|>") == 0;
 }
 
+// Number of bytes in the UTF-8 sequence that starts with `lead`, or 0 if
+// `lead` is a continuation byte / not a valid sequence start.
+static inline int utf8_seq_len(unsigned char lead) {
+    if ((lead & 0x80) == 0x00) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+// Token pieces from llama_token_to_piece can split a multi-byte UTF-8
+// character (e.g. an emoji) across a token boundary. JNI's NewStringUTF
+// aborts the whole process if handed a partial sequence, so streaming
+// callbacks must buffer bytes until a full character is available.
+// Appends `data` to `pending`, returns the longest valid-UTF8 prefix ready
+// to emit, and leaves any trailing incomplete sequence in `pending`.
+static std::string utf8_append_and_flush(std::string &pending, const char *data, int n) {
+    pending.append(data, n);
+    size_t flush_len = pending.size();
+    for (size_t back = 1; back <= 4 && back <= pending.size(); ++back) {
+        unsigned char b = (unsigned char) pending[pending.size() - back];
+        int len = utf8_seq_len(b);
+        if (len == 0) continue; // continuation byte, keep scanning backward
+        if ((int) back < len) flush_len = pending.size() - back;
+        break;
+    }
+    std::string ready = pending.substr(0, flush_len);
+    pending.erase(0, flush_len);
+    return ready;
+}
+
 // Streams tokens from a prepared prompt string
 static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallback, const StreamMethods &m) {
     LOGI("stream_from_prompt: waiting for mutex...");
@@ -828,6 +859,7 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
 
     char piece_buf[768];
     char spec_buf[64];
+    std::string pending_utf8;
 
     LOGI("stream_from_prompt: starting token generation loop, max_tokens=%d, session=%llu",
          max_new_tokens, (unsigned long long)session_id);
@@ -861,11 +893,13 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
                 tok, piece_buf, (int) sizeof(piece_buf),
                 /* lstrip */ 0, /* special */ 0);
         if (nn > 0) {
-            piece_buf[std::min(nn, (int) sizeof(piece_buf) - 1)] = '\0';
-            jstring delta = env->NewStringUTF(piece_buf);
-            if (delta) {
-                env->CallVoidMethod(jCallback, m.onDelta, delta);
-                env->DeleteLocalRef(delta);
+            std::string ready = utf8_append_and_flush(pending_utf8, piece_buf, nn);
+            if (!ready.empty()) {
+                jstring delta = env->NewStringUTF(ready.c_str());
+                if (delta) {
+                    env->CallVoidMethod(jCallback, m.onDelta, delta);
+                    env->DeleteLocalRef(delta);
+                }
             }
         }
 
@@ -1260,6 +1294,7 @@ static void vision_stream_from_pos(
     int cur_pos = (int)start_pos;
     char piece_buf[768];
     char spec_buf[64];
+    std::string pending_utf8;
 
     for (int i = 0; i < max_new_tokens; ++i) {
         if (should_cancel_session(session_id)) break;
@@ -1276,9 +1311,11 @@ static void vision_stream_from_pos(
         llama_sampler_accept(sampler, tok);
 
         int nn = llama_token_to_piece(vocab, tok, piece_buf, (int)sizeof(piece_buf), 0, 0);
-        if (nn > 0 && on_delta) {
-            piece_buf[std::min(nn, (int)sizeof(piece_buf) - 1)] = '\0';
-            on_delta(piece_buf, user);
+        if (nn > 0) {
+            std::string ready = utf8_append_and_flush(pending_utf8, piece_buf, nn);
+            if (!ready.empty() && on_delta) {
+                on_delta(ready.c_str(), user);
+            }
         }
 
         if (cur_pos >= n_ctx) break;
