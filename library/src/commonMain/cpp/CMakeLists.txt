@@ -10,6 +10,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(ANDROID)
     add_link_options("-Wl,-z,max-page-size=16384")
+    # Disable OpenMP on Android: ggml falls back to its own pthread threadpool
+    # (same as the iOS build). This avoids bundling the NDK's prebuilt libomp.so,
+    # which is only 4KB-aligned and breaks 16KB-page-size compatibility.
+    set(GGML_OPENMP OFF CACHE BOOL "Disable OpenMP on Android" FORCE)
 endif()
 
 set(CMAKE_SHARED_LINKER_FLAGS
