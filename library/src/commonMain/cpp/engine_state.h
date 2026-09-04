@@ -38,6 +38,16 @@ void cancel_session(uint64_t session_id);
 /// Requests that every session stop, including any that starts before the flag is cleared.
 void cancel_all_sessions();
 
+/// The most recently started session, or 0 if none has started.
+///
+/// For cancelling "whatever is running now". Inherently a snapshot: the session may end
+/// between reading this and acting on it, which is why cancellation is by ID — a late
+/// cancel names a session that is already gone and is ignored.
+uint64_t current_session();
+
+/// The session cancellation is pending for: 0 for none, UINT64_MAX for all. Diagnostics only.
+uint64_t pending_cancel_session();
+
 // ---------------------------------------------------------------------------------
 // Serialising generation against teardown
 // ---------------------------------------------------------------------------------
@@ -51,7 +61,24 @@ public:
     GenerationLock &operator=(const GenerationLock &) = delete;
 };
 
+/// Cancels generation and then holds the generation lock for its own lifetime.
+///
+/// Freeing a model requires holding this across the free, not merely waiting first:
+/// releasing the lock before tearing down reopens the window where a generation can start
+/// on a context that is about to disappear. Unlike GenerationLock this does not mark
+/// generation as in progress, because teardown is not generation.
+class TeardownLock {
+public:
+    TeardownLock();
+    ~TeardownLock();
+    TeardownLock(const TeardownLock &) = delete;
+    TeardownLock &operator=(const TeardownLock &) = delete;
+};
+
 /// Signals cancellation, then blocks until any in-flight generation has actually finished.
+///
+/// Prefer TeardownLock when the caller goes on to free something: this releases the lock
+/// before returning, so it only proves generation *had* stopped.
 ///
 /// Acquiring the generation lock is proof that generation is over, because generation holds
 /// it for its whole duration. The alternative — polling a flag with a timeout — was what

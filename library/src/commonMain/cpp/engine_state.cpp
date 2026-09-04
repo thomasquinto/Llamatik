@@ -53,6 +53,14 @@ void cancel_all_sessions() {
     g_cancel_session_id.store(kCancelAll, std::memory_order_release);
 }
 
+uint64_t current_session() {
+    return g_generation_session_id.load(std::memory_order_relaxed);
+}
+
+uint64_t pending_cancel_session() {
+    return g_cancel_session_id.load(std::memory_order_relaxed);
+}
+
 GenerationLock::GenerationLock() {
     g_generation_mutex.lock();
     g_generation_in_progress.store(true, std::memory_order_release);
@@ -60,6 +68,16 @@ GenerationLock::GenerationLock() {
 
 GenerationLock::~GenerationLock() {
     g_generation_in_progress.store(false, std::memory_order_release);
+    g_generation_mutex.unlock();
+}
+
+TeardownLock::TeardownLock() {
+    cancel_all_sessions();
+    // Blocks until generation releases the lock, and keeps it until this goes out of scope.
+    g_generation_mutex.lock();
+}
+
+TeardownLock::~TeardownLock() {
     g_generation_mutex.unlock();
 }
 

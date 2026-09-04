@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "ggml.h"
+#include "engine_state.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -77,10 +78,6 @@ static struct llama_context *ctx        = nullptr;
 static int                   embedding_size = 0;
 
 static struct llama_model   *gen_model  = nullptr; // generation model
-// Which file gen_model was loaded from. gen_model is shared by the text and vision entry
-// points, so "a model is loaded" is not the same question as "the requested model is
-// loaded"; without this, loading a second model reuses whatever is already resident.
-static std::string          g_gen_model_path;
 static struct llama_context *gen_ctx    = nullptr;
 static struct mtmd_context  *vision_ctx = nullptr;
 
@@ -88,28 +85,15 @@ static bool g_backend_inited = false;
 
 // Generation session ID - incremented for each new generation
 // Used to ensure cancellation only affects the intended generation
-static std::atomic<uint64_t> g_generation_session_id{0};
+using llamatik::GenerationLock;
+using llamatik::TeardownLock;
+using llamatik::should_cancel_session;
 
-// The session ID that should be cancelled (0 = no cancellation pending)
-static std::atomic<uint64_t> g_cancel_session_id{0};
 
 // Flag to track if generation is in progress (for safe shutdown)
-static std::atomic<bool> g_generation_in_progress{false};
 
 // Mutex to serialize generation calls (prevents KV cache corruption)
-static std::mutex g_generation_mutex;
 
-// Stop any in-flight generation and wait until it has actually finished.
-//
-// The generate entry points hold g_generation_mutex for their whole duration, so acquiring
-// it is proof that generation is over — unlike polling g_generation_in_progress with a
-// timeout, which gave up after 5s and freed the model anyway. An image encode can run for
-// half a minute and cannot be interrupted partway, so that timeout expired and the encode
-// finished writing into a freed context: SIGSEGV, tens of seconds after the free.
-static void stop_generation_and_wait() {
-    g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
-    std::lock_guard<std::mutex> lock(g_generation_mutex);
-}
 
 // Generation parameters (atomic for safe update while app is running)
 static std::atomic<float> g_temperature{0.7f};   // align with app default
@@ -124,10 +108,6 @@ static std::atomic<float> g_repeat_penalty{1.10f};
 // Returns true if:
 // 1. The cancel_session_id matches this session (targeted cancellation), OR
 // 2. The cancel_session_id is UINT64_MAX (shutdown/force cancel all)
-static inline bool should_cancel_session(uint64_t session_id) {
-    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
-    return cancel_id == session_id || cancel_id == UINT64_MAX;
-}
 
 static int tokenize_with_retry(const llama_vocab *vocab,
         const char *text,
@@ -420,9 +400,9 @@ bool llama_embed_init(const char *model_path) {
 void llama_generate_cancel(void) {
     // Cancel the CURRENT session only
     // This prevents race conditions where a late cancellation affects a new generation
-    uint64_t current_session = g_generation_session_id.load(std::memory_order_relaxed);
+    uint64_t current_session = llamatik::current_session();
     DBG("llama_generate_cancel: requesting cancel for session %llu", (unsigned long long)current_session);
-    g_cancel_session_id.store(current_session, std::memory_order_relaxed);
+    llamatik::cancel_session(current_session);
 }
 
 float *llama_embed(const char *input) {
@@ -509,7 +489,9 @@ bool llama_generate_init(const char *model_path) {
         g_last_error.clear();
     }
 
-    stop_generation_and_wait();
+    // Holds the generation lock across the teardown and the load that follows, so nothing
+    // can generate into a context that is being replaced.
+    TeardownLock teardown;
 
     if (vision_ctx) {
         mtmd_free(vision_ctx);
@@ -524,7 +506,7 @@ bool llama_generate_init(const char *model_path) {
         gen_model = nullptr;
     }
 
-    g_gen_model_path.clear();
+    llamatik::clear_resident_model_path();
 
     gen_model = load_model_with_fallback(model_path);
     if (!gen_model) return false;
@@ -537,10 +519,10 @@ bool llama_generate_init(const char *model_path) {
     if (!gen_ctx) {
         llama_model_free(gen_model);
         gen_model = nullptr;
-        g_gen_model_path.clear();
+        llamatik::clear_resident_model_path();
         return false;
     }
-    g_gen_model_path = model_path;
+    llamatik::set_resident_model_path(model_path);
     DBG("generate: n_ctx = %u", (unsigned)llama_n_ctx(gen_ctx));
     return true;
 }
@@ -555,8 +537,10 @@ const char *llama_generate_last_error(void) {
 char *llama_generate(const char *prompt) {
     if (!gen_ctx || !gen_model || !prompt) return nullptr;
 
-    // Assign a new session ID for this generation
-    uint64_t session_id = ++g_generation_session_id;
+    // llama_generate touches gen_ctx but never took the generation lock, so a teardown
+    // could free the context underneath it. RAII closes that and clears any stale cancel.
+    GenerationLock lock;
+    const uint64_t session_id = llamatik::begin_session();
 
     // Snapshot params at start (atomic -> local)
     const float temperature    = g_temperature.load(std::memory_order_relaxed);
@@ -565,13 +549,6 @@ char *llama_generate(const char *prompt) {
     const int   top_k          = g_top_k.load(std::memory_order_relaxed);
     const float repeat_penalty = g_repeat_penalty.load(std::memory_order_relaxed);
 
-    // Clear any stale cancellation that was for a previous session
-    // Clear if: cancel was for an older session, OR it's UINT64_MAX (shutdown signal)
-    // UINT64_MAX must be cleared because it cancels ALL sessions, including new ones
-    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
-    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
-        g_cancel_session_id.store(0, std::memory_order_relaxed);
-    }
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
@@ -733,28 +710,18 @@ void llama_generate_stream(const char *prompt,
         llm_on_error on_error,
         void *user) {
     // Serialize generation calls to prevent KV cache corruption
-    std::lock_guard<std::mutex> lock(g_generation_mutex);
+    GenerationLock lock;
 
     // Assign a new session ID for this generation
     // This must happen AFTER acquiring the mutex to ensure uniqueness
-    uint64_t session_id = ++g_generation_session_id;
+    const uint64_t session_id = llamatik::begin_session();
     DBG("llama_generate_stream: session_id=%llu, cancel_session=%llu",
         (unsigned long long)session_id,
-        (unsigned long long)g_cancel_session_id.load());
+        (unsigned long long)llamatik::pending_cancel_session());
 
     if (!gen_ctx || !gen_model || !prompt) { if (on_error) on_error("generator not ready", user); return; }
 
     // Mark generation as in progress (for safe shutdown)
-    g_generation_in_progress.store(true, std::memory_order_release);
-
-    // Clear any stale cancellation that was for a previous session
-    // Clear if: cancel was for an older session, OR it's UINT64_MAX (shutdown signal)
-    // UINT64_MAX must be cleared because it cancels ALL sessions, including new ones
-    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
-    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
-        g_cancel_session_id.store(0, std::memory_order_relaxed);
-        DBG("llama_generate_stream: cleared stale cancel (was %llu)", (unsigned long long)cancel_id);
-    }
 
     // Snapshot params at start (atomic -> local)
     const float temperature    = g_temperature.load(std::memory_order_relaxed);
@@ -771,7 +738,6 @@ void llama_generate_stream(const char *prompt,
             prompt,
             tokens, /*add_bos*/ true, /*parse_special*/ true);
     if (n_tokens <= 0) {
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("tokenize failed", user);
         return;
     }
@@ -794,7 +760,6 @@ void llama_generate_stream(const char *prompt,
 
     if (llama_decode(gen_ctx, batch) != 0) {
         llama_batch_free(batch);
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("decode failed", user);
         return;
     }
@@ -802,7 +767,6 @@ void llama_generate_stream(const char *prompt,
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!sampler) {
         llama_batch_free(batch);
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("sampler init failed", user);
         return;
     }
@@ -897,7 +861,6 @@ void llama_generate_stream(const char *prompt,
     llama_sampler_free(sampler);
 
     // Mark generation as complete (for safe shutdown)
-    g_generation_in_progress.store(false, std::memory_order_release);
 
     if (on_done) on_done(user);
 }
@@ -928,15 +891,13 @@ void llama_generate_set_params(float temperature,
 }
 
 void llama_generate_free() {
-    DBG("llama_generate_free: starting, generation_in_progress=%d", g_generation_in_progress.load());
+    DBG("llama_generate_free: starting, generation_in_progress=%d", llamatik::generation_in_progress());
 
     // Signal cancellation for ALL sessions (force shutdown)
     // UINT64_MAX is a special value that cancels any session
-    g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
-
-    // Wait for generation to actually finish. This used to poll for 5s and then free
+    // Cancels and holds the lock across the free. This used to poll for 5s and then free
     // regardless, which is exactly how a 27s image encode outlived its own context.
-    stop_generation_and_wait();
+    TeardownLock teardown;
 
     if (gen_ctx)   llama_free(gen_ctx);
     if (gen_model) llama_model_free(gen_model);
@@ -944,7 +905,7 @@ void llama_generate_free() {
     gen_ctx   = nullptr;
     gen_model = nullptr;
     vision_ctx = nullptr;
-    g_gen_model_path.clear();
+    llamatik::clear_resident_model_path();
 
     if (!ctx && !model && g_backend_inited) {
         llama_backend_free();
@@ -1120,13 +1081,13 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
     // Reuse the resident model only when it is the one requested. Otherwise free it first:
     // attaching a new projector to a stale base model does not load the model that was
     // asked for, and fails or crashes rather than doing nothing.
-    if ((gen_model || gen_ctx) && g_gen_model_path != model_path) {
+    if ((gen_model || gen_ctx) && !llamatik::can_reuse_resident_model(true, model_path)) {
         DBG("llama_vision_init: replacing resident model");
-        stop_generation_and_wait();
+        TeardownLock teardown;
         if (vision_ctx) { mtmd_free(vision_ctx); vision_ctx = nullptr; }
         if (gen_ctx)    { llama_free(gen_ctx);   gen_ctx    = nullptr; }
         if (gen_model)  { llama_model_free(gen_model); gen_model = nullptr; }
-        g_gen_model_path.clear();
+        llamatik::clear_resident_model_path();
     }
 
     if (!gen_model || !gen_ctx) {
@@ -1146,7 +1107,7 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
             gen_model = nullptr;
             return false;
         }
-        g_gen_model_path = model_path;
+        llamatik::set_resident_model_path(model_path);
     }
 
     if (vision_ctx) {
@@ -1303,8 +1264,8 @@ void llama_vision_generate_messages_stream(const char **roles,
         llm_on_done on_done,
         llm_on_error on_error,
         void *user) {
-    std::lock_guard<std::mutex> lock(g_generation_mutex);
-    const uint64_t session_id = ++g_generation_session_id;
+    GenerationLock lock;
+    const uint64_t session_id = llamatik::begin_session();
 
     if (!gen_ctx || !gen_model || !vision_ctx) {
         if (on_error) on_error("vision model not initialized", user);
@@ -1319,12 +1280,6 @@ void llama_vision_generate_messages_stream(const char **roles,
         return;
     }
 
-    uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
-    if (cancel_id != 0 && (cancel_id < session_id || cancel_id == UINT64_MAX)) {
-        g_cancel_session_id.store(0, std::memory_order_relaxed);
-    }
-
-    g_generation_in_progress.store(true, std::memory_order_release);
     llama_memory_clear(llama_get_memory(gen_ctx), true);
 
     std::vector<mtmd_bitmap *> bitmaps;
@@ -1335,8 +1290,7 @@ void llama_vision_generate_messages_stream(const char **roles,
         auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false, mtmd_helper_init_opt_default());
         if (!bitmap.bitmap) {
             for (mtmd_bitmap *loaded : bitmaps) mtmd_bitmap_free(loaded);
-            g_generation_in_progress.store(false, std::memory_order_release);
-            if (on_error) on_error("failed to load image", user);
+                if (on_error) on_error("failed to load image", user);
             return;
         }
         bitmaps.push_back(bitmap.bitmap);
@@ -1349,7 +1303,6 @@ void llama_vision_generate_messages_stream(const char **roles,
     std::string prompt = build_vision_prompt_ios(roles, contents, n_messages, n_images);
     if (prompt.empty()) {
         for (mtmd_bitmap *bitmap : bitmaps) mtmd_bitmap_free(bitmap);
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("failed to build chat template prompt", user);
         return;
     }
@@ -1374,7 +1327,6 @@ void llama_vision_generate_messages_stream(const char **roles,
 
     if (tokenize_result != 0) {
         mtmd_input_chunks_free(chunks);
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("failed to tokenize multimodal prompt", user);
         return;
     }
@@ -1392,13 +1344,11 @@ void llama_vision_generate_messages_stream(const char **roles,
     mtmd_input_chunks_free(chunks);
 
     if (eval_result != 0) {
-        g_generation_in_progress.store(false, std::memory_order_release);
         if (on_error) on_error("failed to evaluate multimodal prompt", user);
         return;
     }
 
     llama_vision_stream_from_pos(session_id, new_n_past, on_delta, on_done, on_error, user);
-    g_generation_in_progress.store(false, std::memory_order_release);
 }
 
 } // extern "C"

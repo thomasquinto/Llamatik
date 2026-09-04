@@ -114,11 +114,52 @@ static void cancelling_one_session_leaves_others_alone() {
     check(!should_cancel_session(current), "a stale session id does not cancel the current one");
 }
 
+// Cancelling "whatever is running" has to name the running session, not a constant, or a
+// late cancel would kill whichever generation happened to be running when it arrived.
+static void cancelling_the_current_session_targets_it_by_id() {
+    std::printf("cancelling_the_current_session_targets_it_by_id\n");
+
+    const uint64_t running = begin_session();
+    check(current_session() == running, "current_session reports the running session");
+
+    cancel_session(current_session());
+    check(should_cancel_session(running), "cancelling the current session cancels it");
+    check(pending_cancel_session() == running, "the pending cancel names that session");
+
+    const uint64_t next = begin_session();
+    check(!should_cancel_session(next), "the cancel does not carry into the next session");
+}
+
+// Teardown must hold the lock across the free, not just wait and let go: releasing first
+// lets a generation start on a context that is about to be freed.
+static void teardown_holds_the_lock_while_it_runs() {
+    std::printf("teardown_holds_the_lock_while_it_runs\n");
+
+    std::atomic<bool> generation_started{false};
+
+    {
+        TeardownLock teardown;
+        std::thread contender([&] {
+            GenerationLock lock;      // must block until the teardown scope ends
+            generation_started.store(true);
+        });
+        std::this_thread::sleep_for(80ms);
+        check(!generation_started.load(), "no generation can start while teardown holds the lock");
+        // Releasing here lets the contender through.
+        contender.detach();
+    }
+
+    std::this_thread::sleep_for(80ms);
+    check(generation_started.load(), "generation proceeds once teardown releases");
+}
+
 int main() {
     waits_for_generation_to_actually_finish();
     reuses_a_model_only_when_it_is_the_one_requested();
     a_stale_cancellation_does_not_kill_the_next_session();
     cancelling_one_session_leaves_others_alone();
+    cancelling_the_current_session_targets_it_by_id();
+    teardown_holds_the_lock_while_it_runs();
 
     if (g_failures == 0) {
         std::printf("\nengine_state: all checks passed\n");
