@@ -64,6 +64,14 @@ static struct llama_model *gen_model = nullptr;
 static struct llama_context *gen_ctx = nullptr;
 static struct mtmd_context *vision_ctx = nullptr;
 
+// Which file gen_model was loaded from.
+//
+// gen_model is shared by the text and vision entry points, so "a model is loaded" is not the
+// same question as "the requested model is loaded". Without this, loading a text model and then
+// a vision one attaches the vision projector to whatever was already resident, which fails and
+// keeps failing until the process restarts.
+static std::string g_gen_model_path;
+
 // Backend lifetime
 static bool g_backend_inited = false;
 
@@ -131,6 +139,18 @@ static std::atomic<int>   g_max_new_tokens = 512;    // align with app default
 static inline bool should_cancel_session(uint64_t session_id) {
     uint64_t cancel_id = g_cancel_session_id.load(std::memory_order_relaxed);
     return cancel_id == session_id || cancel_id == UINT64_MAX;
+}
+
+// Carries the session through llama.cpp's abort callback, which only takes a void*.
+struct vision_abort_state {
+    uint64_t session_id;
+};
+
+// Returning true tells ggml to stop the graph mid-compute. Called frequently from the compute
+// threads, so it must stay a relaxed atomic read and nothing more.
+static bool vision_should_abort(void *data) {
+    const auto *state = static_cast<const vision_abort_state *>(data);
+    return state != nullptr && should_cancel_session(state->session_id);
 }
 
 static inline std::string trim(const std::string &s) {
@@ -474,6 +494,7 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     gen_ctx = nullptr;
     gen_model = nullptr;
     vision_ctx = nullptr;
+    g_gen_model_path.clear();
 
     g_generation_in_progress.store(false, std::memory_order_release);
 
@@ -537,6 +558,8 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
         llama_model_free(gen_model);
         gen_model = nullptr;
     }
+    // This path owns gen_model too, so it owns the record of what gen_model is.
+    g_gen_model_path.clear();
 
     // Clear last error before loading
     {
@@ -549,6 +572,8 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     mparams.n_gpu_layers = 99;
     LOGI("Loading model with n_gpu_layers=%d", mparams.n_gpu_layers);
     gen_model = llama_model_load_from_file(path, mparams);
+    // Copy before handing the chars back to the JVM; `path` dangles after this.
+    const std::string requested_path = path ? path : "";
     env->ReleaseStringUTFChars(modelPath, path);
 
     if (!gen_model) {
@@ -572,10 +597,13 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     if (!gen_ctx) {
         llama_model_free(gen_model);
         gen_model = nullptr;
+        g_gen_model_path.clear();
         jclass exClass = env->FindClass("java/lang/RuntimeException");
         env->ThrowNew(exClass, "Failed to create model context");
         return JNI_FALSE;
     }
+
+    g_gen_model_path = requested_path;
 
     LOGI("Gen context ready. n_ctx=%u", (unsigned)llama_n_ctx(gen_ctx));
     return JNI_TRUE;
@@ -1219,6 +1247,27 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
         g_backend_inited = true;
     }
 
+    // Reuse the resident model only when it is the one being asked for. initGenerateModel()
+    // already frees unconditionally before it loads; this is the same rule, stated as a match
+    // so that re-selecting the current vision model does not reload gigabytes for nothing.
+    if ((gen_model || gen_ctx) && g_gen_model_path != model_path) {
+        LOGI("llama_vision_init: replacing resident model '%s' with '%s'",
+             g_gen_model_path.c_str(), model_path);
+        if (vision_ctx) {
+            mtmd_free(vision_ctx);
+            vision_ctx = nullptr;
+        }
+        if (gen_ctx) {
+            llama_free(gen_ctx);
+            gen_ctx = nullptr;
+        }
+        if (gen_model) {
+            llama_model_free(gen_model);
+            gen_model = nullptr;
+        }
+        g_gen_model_path.clear();
+    }
+
     if (!gen_model || !gen_ctx) {
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = 99;
@@ -1238,6 +1287,7 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
             gen_model = nullptr;
             return false;
         }
+        g_gen_model_path = model_path;
     }
 
     if (vision_ctx) {
@@ -1459,21 +1509,60 @@ void llama_vision_generate_messages_stream(const char **roles,
         return;
     }
 
+    // Evaluate the prompt one chunk at a time rather than through mtmd_helper_eval_chunks(),
+    // so cancellation is checked between chunks. The helper evaluates everything in a single
+    // call, which meant shutdown() could not get the generation mutex until every image had
+    // been encoded — on a large vision model that is many seconds of uninterruptible work, and
+    // it froze whichever thread was waiting to free the model.
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
     llama_pos new_n_past = 0;
-    int32_t eval_result = mtmd_helper_eval_chunks(
-            vision_ctx,
-            gen_ctx,
-            chunks,
-            0,
-            0,
-            512,
-            true,
-            &new_n_past);
+    int32_t eval_result = 0;
+    bool cancelled = false;
+
+    // Also abort inside llama_decode(), which handles the text half of the prompt and the
+    // per-image embedding decode. The image encode itself stays uninterruptible: clip exposes
+    // no abort hook, so a single image still runs to completion.
+    vision_abort_state abort_state{session_id};
+    llama_set_abort_callback(gen_ctx, vision_should_abort, &abort_state);
+
+    for (size_t i = 0; i < n_chunks; ++i) {
+        if (should_cancel_session(session_id)) {
+            LOGI("vision_generate: cancel requested for session %llu at chunk %zu/%zu",
+                 (unsigned long long)session_id, i, n_chunks);
+            cancelled = true;
+            break;
+        }
+        const bool is_last = (i + 1 == n_chunks);
+        eval_result = mtmd_helper_eval_chunk_single(
+                vision_ctx,
+                gen_ctx,
+                mtmd_input_chunks_get(chunks, i),
+                new_n_past,
+                0,
+                512,
+                /* logits_last */ is_last,
+                &new_n_past);
+        if (eval_result != 0) break;
+    }
+
+    llama_set_abort_callback(gen_ctx, nullptr, nullptr);
     mtmd_input_chunks_free(chunks);
+
+    if (cancelled) {
+        g_generation_in_progress.store(false, std::memory_order_release);
+        // A cancelled prompt is not a failure; the caller asked for this.
+        if (on_done) on_done(user);
+        return;
+    }
 
     if (eval_result != 0) {
         g_generation_in_progress.store(false, std::memory_order_release);
-        if (on_error) on_error("failed to evaluate multimodal prompt", user);
+        // An aborted llama_decode() also lands here, so say which it was.
+        if (should_cancel_session(session_id)) {
+            if (on_done) on_done(user);
+        } else if (on_error) {
+            on_error("failed to evaluate multimodal prompt", user);
+        }
         return;
     }
 
