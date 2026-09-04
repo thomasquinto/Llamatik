@@ -68,6 +68,7 @@ add_subdirectory(
 add_library(llama_jni SHARED
         llama_jni.cpp
         llama_embed.cpp
+        engine_state.cpp
         ${LLAMA_SOURCES}
 )
 

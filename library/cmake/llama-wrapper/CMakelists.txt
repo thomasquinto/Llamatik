@@ -31,7 +31,7 @@ add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory(${LLAMA_CPP_DIR} llama-local-build EXCLUDE_FROM_ALL)
 
 set(MTMD_VIDEO OFF CACHE BOOL "Disable mtmd video support for mobile embedded builds" FORCE)
-set(MTMD_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
 if(NOT DEFINED LLAMA_INSTALL_VERSION)
     set(LLAMA_INSTALL_VERSION 0.0.0)
 endif()
@@ -40,6 +40,7 @@ add_subdirectory(${LLAMA_CPP_DIR}/tools/mtmd mtmd-local-build EXCLUDE_FROM_ALL)
 # ---- Your wrapper -----------------------------------------------------------
 add_library(llama_static_wrapper STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/iosMain/cpp/llama_embed.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/commonMain/cpp/engine_state.cpp
 )
 
 target_include_directories(llama_static_wrapper PUBLIC
@@ -49,6 +50,7 @@ target_include_directories(llama_static_wrapper PUBLIC
         ${LLAMA_CPP_DIR}/ggml/include
         ${LLAMA_CPP_DIR}/tools/mtmd
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/iosMain/c_interop/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/commonMain/cpp
 )
 
 # Prefer standard <filesystem> in your source; avoid <__filesystem/...>
