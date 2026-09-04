@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "ggml.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -76,6 +77,10 @@ static struct llama_context *ctx        = nullptr;
 static int                   embedding_size = 0;
 
 static struct llama_model   *gen_model  = nullptr; // generation model
+// Which file gen_model was loaded from. gen_model is shared by the text and vision entry
+// points, so "a model is loaded" is not the same question as "the requested model is
+// loaded"; without this, loading a second model reuses whatever is already resident.
+static std::string          g_gen_model_path;
 static struct llama_context *gen_ctx    = nullptr;
 static struct mtmd_context  *vision_ctx = nullptr;
 
@@ -93,6 +98,18 @@ static std::atomic<bool> g_generation_in_progress{false};
 
 // Mutex to serialize generation calls (prevents KV cache corruption)
 static std::mutex g_generation_mutex;
+
+// Stop any in-flight generation and wait until it has actually finished.
+//
+// The generate entry points hold g_generation_mutex for their whole duration, so acquiring
+// it is proof that generation is over — unlike polling g_generation_in_progress with a
+// timeout, which gave up after 5s and freed the model anyway. An image encode can run for
+// half a minute and cannot be interrupted partway, so that timeout expired and the encode
+// finished writing into a freed context: SIGSEGV, tens of seconds after the free.
+static void stop_generation_and_wait() {
+    g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(g_generation_mutex);
+}
 
 // Generation parameters (atomic for safe update while app is running)
 static std::atomic<float> g_temperature{0.7f};   // align with app default
@@ -150,8 +167,9 @@ static llama_model *load_model_with_fallback(const char *path) {
     llama_model_params mp = llama_model_default_params();
 
 #if TARGET_OS_SIMULATOR
-    mp.use_mmap     = false;
-    mp.use_mlock    = false;
+    // b10809 replaced the use_mmap/use_mlock booleans with a load mode.
+    // NONE is the old (false, false): no mapping, no locking.
+    mp.load_mode    = LLAMA_LOAD_MODE_NONE;
     mp.n_gpu_layers = 0;
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE;
 #endif
@@ -159,8 +177,9 @@ static llama_model *load_model_with_fallback(const char *path) {
     llama_model *m = llama_model_load_from_file(path, mp);
     if (m) return m;
 
-    mp.use_mmap     = false;
-    mp.use_mlock    = false;
+    // b10809 replaced the use_mmap/use_mlock booleans with a load mode.
+    // NONE is the old (false, false): no mapping, no locking.
+    mp.load_mode    = LLAMA_LOAD_MODE_NONE;
     mp.n_gpu_layers = 0;
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE;
 
@@ -477,6 +496,9 @@ bool llama_generate_init(const char *model_path) {
     dbg_init();
     if (!g_backend_inited) {
         llama_log_set(ios_log_callback, nullptr);
+        // ggml logs separately, and ggml_abort() writes its assertion text through this
+        // callback before dying. Without it a GGML_ASSERT failure is just a bare crash.
+        ggml_log_set(ios_log_callback, nullptr);
         llama_backend_init();
         g_backend_inited = true;
     }
@@ -486,6 +508,8 @@ bool llama_generate_init(const char *model_path) {
         std::lock_guard<std::mutex> lock(g_last_error_mutex);
         g_last_error.clear();
     }
+
+    stop_generation_and_wait();
 
     if (vision_ctx) {
         mtmd_free(vision_ctx);
@@ -500,6 +524,8 @@ bool llama_generate_init(const char *model_path) {
         gen_model = nullptr;
     }
 
+    g_gen_model_path.clear();
+
     gen_model = load_model_with_fallback(model_path);
     if (!gen_model) return false;
 
@@ -511,8 +537,10 @@ bool llama_generate_init(const char *model_path) {
     if (!gen_ctx) {
         llama_model_free(gen_model);
         gen_model = nullptr;
+        g_gen_model_path.clear();
         return false;
     }
+    g_gen_model_path = model_path;
     DBG("generate: n_ctx = %u", (unsigned)llama_n_ctx(gen_ctx));
     return true;
 }
@@ -582,7 +610,7 @@ char *llama_generate(const char *prompt) {
         llama_batch_free(batch);
         return nullptr;
     }
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -778,7 +806,7 @@ void llama_generate_stream(const char *prompt,
         if (on_error) on_error("sampler init failed", user);
         return;
     }
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -906,21 +934,9 @@ void llama_generate_free() {
     // UINT64_MAX is a special value that cancels any session
     g_cancel_session_id.store(UINT64_MAX, std::memory_order_release);
 
-    // Wait for any ongoing generation to complete (with timeout)
-    // This is critical to prevent use-after-free crashes
-    int wait_count = 0;
-    const int max_wait_ms = 5000; // 5 second timeout
-    const int sleep_ms = 10;
-    while (g_generation_in_progress.load(std::memory_order_acquire) && wait_count < (max_wait_ms / sleep_ms)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-        wait_count++;
-    }
-
-    if (wait_count >= (max_wait_ms / sleep_ms)) {
-        DBG("llama_generate_free: WARNING - generation did not stop within timeout");
-    } else {
-        DBG("llama_generate_free: generation stopped after %d ms", wait_count * sleep_ms);
-    }
+    // Wait for generation to actually finish. This used to poll for 5s and then free
+    // regardless, which is exactly how a 27s image encode outlived its own context.
+    stop_generation_and_wait();
 
     if (gen_ctx)   llama_free(gen_ctx);
     if (gen_model) llama_model_free(gen_model);
@@ -928,6 +944,7 @@ void llama_generate_free() {
     gen_ctx   = nullptr;
     gen_model = nullptr;
     vision_ctx = nullptr;
+    g_gen_model_path.clear();
 
     if (!ctx && !model && g_backend_inited) {
         llama_backend_free();
@@ -1093,8 +1110,23 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
 
     if (!g_backend_inited) {
         llama_log_set(ios_log_callback, nullptr);
+        // ggml logs separately, and ggml_abort() writes its assertion text through this
+        // callback before dying. Without it a GGML_ASSERT failure is just a bare crash.
+        ggml_log_set(ios_log_callback, nullptr);
         llama_backend_init();
         g_backend_inited = true;
+    }
+
+    // Reuse the resident model only when it is the one requested. Otherwise free it first:
+    // attaching a new projector to a stale base model does not load the model that was
+    // asked for, and fails or crashes rather than doing nothing.
+    if ((gen_model || gen_ctx) && g_gen_model_path != model_path) {
+        DBG("llama_vision_init: replacing resident model");
+        stop_generation_and_wait();
+        if (vision_ctx) { mtmd_free(vision_ctx); vision_ctx = nullptr; }
+        if (gen_ctx)    { llama_free(gen_ctx);   gen_ctx    = nullptr; }
+        if (gen_model)  { llama_model_free(gen_model); gen_model = nullptr; }
+        g_gen_model_path.clear();
     }
 
     if (!gen_model || !gen_ctx) {
@@ -1114,6 +1146,7 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
             gen_model = nullptr;
             return false;
         }
+        g_gen_model_path = model_path;
     }
 
     if (vision_ctx) {
@@ -1201,7 +1234,7 @@ static void llama_vision_stream_from_pos(
         if (on_error) on_error("sampler init failed", user);
         return;
     }
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -1299,7 +1332,7 @@ void llama_vision_generate_messages_stream(const char **roles,
     bitmaps.reserve(n_images);
     bitmap_refs.reserve(n_images);
     for (int i = 0; i < n_images; ++i) {
-        auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false);
+        auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false, mtmd_helper_init_opt_default());
         if (!bitmap.bitmap) {
             for (mtmd_bitmap *loaded : bitmaps) mtmd_bitmap_free(loaded);
             g_generation_in_progress.store(false, std::memory_order_release);
@@ -1323,6 +1356,9 @@ void llama_vision_generate_messages_stream(const char **roles,
 
     mtmd_input_text text{};
     text.text = prompt.c_str();
+    // b10809 added text_len; leaving it zero tokenizes an empty prompt, which yields no
+    // chunks and only fails later as a null-logits assertion inside the sampler.
+    text.text_len = prompt.size();
     text.add_special = true;
     text.parse_special = true;
 
