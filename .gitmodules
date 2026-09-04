@@ -1,4 +1,4 @@
 [submodule "llama.cpp"]
 	path = llama.cpp
 	url = https://github.com/thomasquinto/llama.cpp.git
-	branch = edge-ai-customizations
+	branch = edge-ai-customizations-b10809

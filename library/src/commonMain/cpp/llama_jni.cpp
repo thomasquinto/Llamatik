@@ -1,6 +1,7 @@
 #include <jni.h>
 #include "llama.h"
 #include "llama_jni.h"
+#include "ggml.h"
 #include "ggml-backend.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -519,6 +520,10 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     if (!g_backend_inited) {
         // Set up log callback before initializing backend
         llama_log_set(llama_log_callback, nullptr);
+        // ggml logs separately from llama, and ggml_abort() writes its assertion text
+        // through this callback before dying. Without it, a GGML_ASSERT failure reaches
+        // Android as a bare SIGABRT with the message lost on stderr.
+        ggml_log_set(llama_log_callback, nullptr);
 
         llama_backend_init();
         g_backend_inited = true;
@@ -669,7 +674,7 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
          temperature, top_p, top_k, max_new_tokens);
 
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -877,7 +882,7 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
     int   max_new_tokens = g_max_new_tokens.load();
 
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -1243,6 +1248,10 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
 
     if (!g_backend_inited) {
         llama_log_set(llama_log_callback, nullptr);
+        // ggml logs separately from llama, and ggml_abort() writes its assertion text
+        // through this callback before dying. Without it, a GGML_ASSERT failure reaches
+        // Android as a bare SIGABRT with the message lost on stderr.
+        ggml_log_set(llama_log_callback, nullptr);
         llama_backend_init();
         g_backend_inited = true;
     }
@@ -1333,7 +1342,7 @@ static void vision_stream_from_pos(
         if (on_error) on_error("sampler init failed", user);
         return;
     }
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(gen_model)), 128, repeat_penalty, 0.0f, 0.10f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
@@ -1465,7 +1474,7 @@ void llama_vision_generate_messages_stream(const char **roles,
     bitmaps.reserve(n_images);
     bitmap_refs.reserve(n_images);
     for (int i = 0; i < n_images; ++i) {
-        auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false);
+        auto bitmap = mtmd_helper_bitmap_init_from_file(vision_ctx, image_paths[i], false, mtmd_helper_init_opt_default());
         if (!bitmap.bitmap) {
             for (mtmd_bitmap *loaded : bitmaps) mtmd_bitmap_free(loaded);
             g_generation_in_progress.store(false, std::memory_order_release);
@@ -1489,6 +1498,10 @@ void llama_vision_generate_messages_stream(const char **roles,
 
     mtmd_input_text text{};
     text.text = prompt.c_str();
+    // b10809 added text_len; mtmd now reads exactly this many bytes rather than to the
+    // terminator. Leaving it zero tokenizes an empty prompt, which yields no chunks, decodes
+    // nothing, and only surfaces later as a null-logits abort inside the sampler.
+    text.text_len = prompt.size();
     text.add_special = true;
     text.parse_special = true;
 

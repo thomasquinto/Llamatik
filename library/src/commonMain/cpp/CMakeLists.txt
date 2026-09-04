@@ -53,7 +53,9 @@ add_compile_definitions(GGML_MAX_NAME=128)
 add_subdirectory("${CMAKE_SOURCE_DIR}/../../../../llama.cpp/" "${CMAKE_BINARY_DIR}/llama")
 
 set(MTMD_VIDEO OFF CACHE BOOL "Disable mtmd video support for mobile embedded builds" FORCE)
-set(MTMD_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
+# Upstream gates the mtmd CLI binaries on LLAMA_BUILD_TOOLS as of b10809; the local
+# MTMD_BUILD_TOOLS patch this replaced is no longer carried.
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Do not build mtmd command-line tools for mobile embedded builds" FORCE)
 if(NOT DEFINED LLAMA_INSTALL_VERSION)
     set(LLAMA_INSTALL_VERSION 0.0.0)
 endif()
