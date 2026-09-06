@@ -136,7 +136,11 @@ kotlin {
                 "$libPath/llama-local-build/ggml/src/libggml-base.a",
                 "$libPath/llama-local-build/ggml/src/libggml-cpu.a",
                 "$libPath/llama-local-build/ggml/src/ggml-blas/libggml-blas.a",
-                "$libPath/llama-local-build/ggml/src/ggml-metal/libggml-metal.a"
+                "$libPath/llama-local-build/ggml/src/ggml-metal/libggml-metal.a",
+                // b10809 gave mtmd a SHA-256 dependency for bitmap IDs, vendored as its own
+                // static library. This list is hardcoded, so a new one has to be added by
+                // hand or the link fails on an undefined hash_sha256_hex.
+                "$libPath/llama-local-build/vendor/hash/libvendor-hash.a"
             )
         }
 
