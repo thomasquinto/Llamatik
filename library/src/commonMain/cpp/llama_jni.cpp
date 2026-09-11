@@ -552,6 +552,11 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     // Enable GPU acceleration - offload all layers to GPU (Vulkan on Android)
     mparams.n_gpu_layers = 99;
     LOGI("Loading model with n_gpu_layers=%d", mparams.n_gpu_layers);
+    // Abort if the chooser has already moved to another model: the load is a blocking
+    // call, so without this a second selection waits out the first in full.
+    const uint64_t load_id = llamatik::begin_load();
+    mparams.progress_callback = llamatik::abort_superseded_load;
+    mparams.progress_callback_user_data = reinterpret_cast<void *>(load_id);
     gen_model = llama_model_load_from_file(path, mparams);
     // Copy before handing the chars back to the JVM; `path` dangles after this.
     const std::string requested_path = path ? path : "";
@@ -1246,6 +1251,10 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
     if (!gen_model || !gen_ctx) {
         llama_model_params mparams = llama_model_default_params();
         mparams.n_gpu_layers = 99;
+        // See the text path: a superseded load must unwind rather than run to completion.
+        const uint64_t load_id = llamatik::begin_load();
+        mparams.progress_callback = llamatik::abort_superseded_load;
+        mparams.progress_callback_user_data = reinterpret_cast<void *>(load_id);
         gen_model = llama_model_load_from_file(model_path, mparams);
         if (!gen_model) {
             LOGE("llama_vision_init: failed to load base model");

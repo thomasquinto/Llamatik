@@ -49,6 +49,45 @@ uint64_t current_session();
 uint64_t pending_cancel_session();
 
 // ---------------------------------------------------------------------------------
+// Model loading
+// ---------------------------------------------------------------------------------
+
+/// Begins a model load and returns its ID, superseding any load already running.
+///
+/// Loading a multi-GB model is a blocking native call. Cancelling the Kotlin coroutine
+/// does not stop it, so picking a second model in the chooser used to wait out the first
+/// load in full — several seconds to a minute — with the spinner stuck on a model the user
+/// had already moved on from.
+///
+/// Supersession is implicit rather than a separate cancel call: a load is cancelled exactly
+/// when it is no longer the newest, which is the same rule the Kotlin side already applies
+/// with its request ID, and leaves no way to forget to cancel the previous one.
+uint64_t begin_load();
+
+/// Whether `load_id` has been superseded by a newer load, or by cancel_all_loads().
+///
+/// Drive llama_model_params.progress_callback from this: returning false from that callback
+/// aborts the load. llama.cpp calls it between tensors, so cancellation lands within a
+/// fraction of a second rather than at the end of the file.
+bool load_superseded(uint64_t load_id);
+
+/// Cancels every in-flight load, for shutdown. The next begin_load() clears it, so this
+/// cannot leak into a later load the way a stale generation cancel once did.
+void cancel_all_loads();
+
+/// The most recently started load, or 0 if none has started. Diagnostics only.
+uint64_t current_load();
+
+/// Progress callback for llama_model_params, aborting a superseded load.
+///
+/// llama.cpp calls this between tensors with progress 0..1 and treats false as "stop".
+/// Pass the load ID as user_data:
+///
+///     mparams.progress_callback           = llamatik::abort_superseded_load;
+///     mparams.progress_callback_user_data = reinterpret_cast<void *>(load_id);
+bool abort_superseded_load(float progress, void *load_id);
+
+// ---------------------------------------------------------------------------------
 // Serialising generation against teardown
 // ---------------------------------------------------------------------------------
 

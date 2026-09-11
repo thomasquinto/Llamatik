@@ -146,6 +146,12 @@ static void truncate_to_ctx(std::vector<llama_token> &tokens, int n_ctx, int res
 static llama_model *load_model_with_fallback(const char *path) {
     llama_model_params mp = llama_model_default_params();
 
+    // Abort if the chooser has already moved to another model: the load is a blocking
+    // call, so without this a second selection waits out the first in full.
+    const uint64_t load_id = llamatik::begin_load();
+    mp.progress_callback = llamatik::abort_superseded_load;
+    mp.progress_callback_user_data = reinterpret_cast<void *>(load_id);
+
 #if TARGET_OS_SIMULATOR
     // b10809 replaced the use_mmap/use_mlock booleans with a load mode.
     // NONE is the old (false, false): no mapping, no locking.

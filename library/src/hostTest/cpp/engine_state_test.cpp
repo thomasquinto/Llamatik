@@ -153,6 +153,59 @@ static void teardown_holds_the_lock_while_it_runs() {
     check(generation_started.load(), "generation proceeds once teardown releases");
 }
 
+
+// A second model chosen in the chooser must supersede the first immediately. Without this
+// the blocking native load ran to completion and the new selection queued behind it.
+static void a_newer_load_supersedes_the_one_running() {
+    std::printf("a_newer_load_supersedes_the_one_running\n");
+
+    const uint64_t first = begin_load();
+    check(!load_superseded(first), "the only load in flight is not superseded");
+
+    const uint64_t second = begin_load();
+    check(load_superseded(first), "the first load is superseded once a second starts");
+    check(!load_superseded(second), "the newest load keeps running");
+    check(first != second, "each load gets its own id");
+}
+
+// Regression, by analogy with the generation bug: a shutdown cancel that stays pending
+// kills the next load, which looks like model selection silently doing nothing.
+static void a_shutdown_cancel_does_not_kill_the_next_load() {
+    std::printf("a_shutdown_cancel_does_not_kill_the_next_load\n");
+
+    const uint64_t during_shutdown = begin_load();
+    cancel_all_loads();
+    check(load_superseded(during_shutdown), "cancel_all_loads stops the load in flight");
+
+    const uint64_t after_restart = begin_load();
+    check(!load_superseded(after_restart), "a load started afterwards runs normally");
+}
+
+// The abort hook runs on the loading thread while the chooser starts another load on the
+// main thread, so supersession has to be visible across threads.
+static void supersession_is_visible_to_the_loading_thread() {
+    std::printf("supersession_is_visible_to_the_loading_thread\n");
+
+    const uint64_t loading = begin_load();
+    std::atomic<bool> observed_cancel{false};
+
+    std::thread loader([&] {
+        for (int i = 0; i < 200; ++i) {
+            if (load_superseded(loading)) {
+                observed_cancel.store(true);
+                return;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+
+    std::this_thread::sleep_for(10ms);
+    begin_load();
+    loader.join();
+
+    check(observed_cancel.load(), "the loading thread sees it has been superseded");
+}
+
 int main() {
     waits_for_generation_to_actually_finish();
     reuses_a_model_only_when_it_is_the_one_requested();
@@ -160,6 +213,9 @@ int main() {
     cancelling_one_session_leaves_others_alone();
     cancelling_the_current_session_targets_it_by_id();
     teardown_holds_the_lock_while_it_runs();
+    a_newer_load_supersedes_the_one_running();
+    a_shutdown_cancel_does_not_kill_the_next_load();
+    supersession_is_visible_to_the_loading_thread();
 
     if (g_failures == 0) {
         std::printf("\nengine_state: all checks passed\n");

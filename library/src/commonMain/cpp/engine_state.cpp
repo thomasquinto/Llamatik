@@ -1,5 +1,7 @@
 #include "engine_state.h"
 
+#include <cstdint>
+
 #include <atomic>
 #include <mutex>
 
@@ -13,6 +15,12 @@ std::atomic<uint64_t> g_generation_session_id{0};
 std::atomic<uint64_t> g_cancel_session_id{0};
 
 std::atomic<bool> g_generation_in_progress{false};
+
+// Newest load. A load is superseded when its ID is not this one.
+std::atomic<uint64_t> g_load_id{0};
+
+// Set by cancel_all_loads(), cleared by the next begin_load().
+std::atomic<bool> g_cancel_all_loads{false};
 
 // Serialises generation against teardown, and against itself: concurrent generations on
 // one context corrupt the KV cache.
@@ -79,6 +87,34 @@ TeardownLock::TeardownLock() {
 
 TeardownLock::~TeardownLock() {
     g_generation_mutex.unlock();
+}
+
+uint64_t begin_load() {
+    // Clear a shutdown cancellation so it cannot kill the load that follows it.
+    g_cancel_all_loads.store(false, std::memory_order_release);
+    return g_load_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool load_superseded(uint64_t load_id) {
+    if (g_cancel_all_loads.load(std::memory_order_acquire)) {
+        return true;
+    }
+    return load_id != g_load_id.load(std::memory_order_acquire);
+}
+
+void cancel_all_loads() {
+    g_cancel_all_loads.store(true, std::memory_order_release);
+}
+
+uint64_t current_load() {
+    return g_load_id.load(std::memory_order_acquire);
+}
+
+bool abort_superseded_load(float progress, void *load_id) {
+    (void) progress;
+    const uint64_t id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(load_id));
+    // Returning false tells llama.cpp to abandon the load.
+    return !load_superseded(id);
 }
 
 void stop_generation_and_wait() {
