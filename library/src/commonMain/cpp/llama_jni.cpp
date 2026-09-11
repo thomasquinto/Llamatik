@@ -941,6 +941,15 @@ static void stream_from_prompt(JNIEnv *env, const char *prompt, jobject jCallbac
 
 // JNI: stream(prompt, callback)
 extern "C"
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_llamatik_library_platform_LlamaBridge_nativeCancelModelLoad(JNIEnv *, jobject) {
+    // Abandon a load in progress. Must be callable while another load is running, which is
+    // the whole point: the next selection cannot start its own load until the current one
+    // lets go, so supersession has to be signalled from outside.
+    llamatik::cancel_all_loads();
+}
+
 JNIEXPORT void JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_nativeGenerateStream(
         JNIEnv *env, jobject /*thiz*/, jstring jPrompt, jobject jCallback) {

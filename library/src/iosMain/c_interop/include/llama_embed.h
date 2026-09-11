@@ -94,6 +94,17 @@ typedef void (*llm_on_error)(const char *utf8, void *user);  // Called on error 
 void llama_generate_cancel(void);
 
 /**
+ * Abandons a model load in progress.
+ *
+ * Callable while a load is running, which is the point: the next selection cannot begin its
+ * own load until the current one releases the provider lock, so supersession has to be
+ * signalled from outside rather than by the load that follows.
+ *
+ * Safe to call when nothing is loading.
+ */
+void llama_model_load_cancel(void);
+
+/**
  * Stream generation from a single prompt.
  * - on_delta: receives incremental UTF-8 chunks (may be short tokens or small pieces)
  * - on_done:  called exactly once on successful completion

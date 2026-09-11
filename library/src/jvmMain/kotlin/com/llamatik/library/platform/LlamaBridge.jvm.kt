@@ -134,4 +134,6 @@ actual object LlamaBridge {
     // Java_com_llamatik_library_platform_LlamaBridge_nativeCancelGenerate
     actual external fun shutdown()
     actual external fun nativeCancelGenerate()
+
+    actual external fun nativeCancelModelLoad()
 }

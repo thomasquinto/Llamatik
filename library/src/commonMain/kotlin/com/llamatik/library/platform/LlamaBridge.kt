@@ -53,6 +53,16 @@ expect object LlamaBridge {
 
     fun shutdown()
     fun nativeCancelGenerate()
+
+    /**
+     * Abandons a model load in progress.
+     *
+     * Called when the user picks a different model. Loading is a blocking native call that
+     * ignores coroutine cancellation, and the next load cannot start until this one lets go
+     * of the provider lock -- so the signal has to come from outside the load rather than
+     * from the load that follows it.
+     */
+    fun nativeCancelModelLoad()
     fun updateGenerateParams(
         temperature: Float,
         maxTokens: Int,

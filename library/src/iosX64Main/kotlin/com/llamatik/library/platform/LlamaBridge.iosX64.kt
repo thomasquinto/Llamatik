@@ -10,6 +10,7 @@ import com.llamatik.library.platform.llama.llama_embedding_size
 import com.llamatik.library.platform.llama.llama_free_embedding
 import com.llamatik.library.platform.llama.llama_generate
 import com.llamatik.library.platform.llama.llama_generate_cancel
+import com.llamatik.library.platform.llama.llama_model_load_cancel
 import com.llamatik.library.platform.llama.llama_generate_chat
 import com.llamatik.library.platform.llama.llama_generate_chat_stream
 import com.llamatik.library.platform.llama.llama_generate_free
@@ -133,6 +134,10 @@ actual object LlamaBridge {
         for (i in 0 until dim) out[i] = ptr[i]
         llama_free_embedding(ptr)
         return out
+    }
+
+    actual fun nativeCancelModelLoad() {
+        llama_model_load_cancel()
     }
 
     actual fun initGenerateModel(modelPath: String): Boolean {

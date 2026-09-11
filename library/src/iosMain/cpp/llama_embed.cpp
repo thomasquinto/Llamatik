@@ -403,6 +403,15 @@ bool llama_embed_init(const char *model_path) {
     return true;
 }
 
+// Abandon a model load in progress.
+//
+// Must be callable while another load holds the load path, which is the whole point: the
+// next selection cannot start its own load until the current one lets go, so supersession
+// has to be signalled from outside rather than by the load that follows.
+void llama_model_load_cancel(void) {
+    llamatik::cancel_all_loads();
+}
+
 void llama_generate_cancel(void) {
     // Cancel the CURRENT session only
     // This prevents race conditions where a late cancellation affects a new generation
