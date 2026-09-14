@@ -110,6 +110,12 @@ uint64_t current_load() {
     return g_load_id.load(std::memory_order_acquire);
 }
 
+bool abort_superseded_load_compute(void *load_id) {
+    const uint64_t id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(load_id));
+    // ggml aborts on true, the opposite of the progress callback below.
+    return load_superseded(id);
+}
+
 bool abort_superseded_load(float progress, void *load_id) {
     (void) progress;
     const uint64_t id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(load_id));

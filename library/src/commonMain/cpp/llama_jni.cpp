@@ -576,6 +576,11 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     }
 
     llama_context_params cparams = llama_context_default_params();
+    // Context creation is where a load spends its time -- reserving compute buffers and
+    // building graphs. Aborting only the file read cancels almost nothing, because mmap
+    // makes that lazy. ggml aborts when this returns true.
+    cparams.abort_callback = llamatik::abort_superseded_load_compute;
+    cparams.abort_callback_data = reinterpret_cast<void *>(load_id);
     cparams.embeddings = false;
     cparams.n_ctx = 4096;
 
@@ -1271,6 +1276,9 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
         }
 
         llama_context_params cparams = llama_context_default_params();
+        // See the text path: the compute phase is the slow one.
+        cparams.abort_callback = llamatik::abort_superseded_load_compute;
+        cparams.abort_callback_data = reinterpret_cast<void *>(load_id);
         cparams.embeddings = false;
         cparams.n_ctx = 4096;
         gen_ctx = llama_init_from_model(gen_model, cparams);

@@ -87,6 +87,17 @@ uint64_t current_load();
 ///     mparams.progress_callback_user_data = reinterpret_cast<void *>(load_id);
 bool abort_superseded_load(float progress, void *load_id);
 
+/// ggml abort callback for the context-creation phase of a load.
+///
+/// Set it on llama_context_params before llama_init_from_model. That phase -- reserving
+/// compute buffers and building graphs -- is where a load actually spends its time; with
+/// mmap the file read is lazy and nearly free, so aborting only the read cancels almost
+/// nothing.
+///
+/// Note the sense is inverted from abort_superseded_load: ggml aborts when this returns
+/// TRUE, while llama.cpp's progress callback aborts when it returns FALSE.
+bool abort_superseded_load_compute(void *load_id);
+
 // ---------------------------------------------------------------------------------
 // Serialising generation against teardown
 // ---------------------------------------------------------------------------------

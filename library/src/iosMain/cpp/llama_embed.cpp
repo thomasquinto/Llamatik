@@ -143,12 +143,15 @@ static void truncate_to_ctx(std::vector<llama_token> &tokens, int n_ctx, int res
     tokens.swap(out);
 }
 
-static llama_model *load_model_with_fallback(const char *path) {
+// out_load_id receives the load's ID, so the caller can abort the context phase with the
+// same one. That phase is where the time actually goes.
+static llama_model *load_model_with_fallback(const char *path, uint64_t *out_load_id = nullptr) {
     llama_model_params mp = llama_model_default_params();
 
     // Abort if the chooser has already moved to another model: the load is a blocking
     // call, so without this a second selection waits out the first in full.
     const uint64_t load_id = llamatik::begin_load();
+    if (out_load_id) *out_load_id = load_id;
     mp.progress_callback = llamatik::abort_superseded_load;
     mp.progress_callback_user_data = reinterpret_cast<void *>(load_id);
 
@@ -523,10 +526,16 @@ bool llama_generate_init(const char *model_path) {
 
     llamatik::clear_resident_model_path();
 
-    gen_model = load_model_with_fallback(model_path);
+    uint64_t load_id = 0;
+    gen_model = load_model_with_fallback(model_path, &load_id);
     if (!gen_model) return false;
 
     llama_context_params ctx_params = llama_context_default_params();
+    // Context creation is where a load spends its time -- reserving compute buffers and
+    // building graphs. With mmap the file read is lazy, so aborting only that cancels
+    // almost nothing. ggml aborts when this returns true.
+    ctx_params.abort_callback = llamatik::abort_superseded_load_compute;
+    ctx_params.abort_callback_data = reinterpret_cast<void *>(load_id);
     ctx_params.embeddings = false;
     ctx_params.n_ctx      = 8192;   // larger context
 
@@ -1106,13 +1115,17 @@ bool llama_vision_init(const char *model_path, const char *projection_model_path
     }
 
     if (!gen_model || !gen_ctx) {
-        gen_model = load_model_with_fallback(model_path);
+        uint64_t load_id = 0;
+        gen_model = load_model_with_fallback(model_path, &load_id);
         if (!gen_model) {
             DBG("llama_vision_init: failed to load base model");
             return false;
         }
 
         llama_context_params ctx_params = llama_context_default_params();
+        // See the text path: the compute phase is the slow one.
+        ctx_params.abort_callback = llamatik::abort_superseded_load_compute;
+        ctx_params.abort_callback_data = reinterpret_cast<void *>(load_id);
         ctx_params.embeddings = false;
         ctx_params.n_ctx = 8192;
         gen_ctx = llama_init_from_model(gen_model, ctx_params);
